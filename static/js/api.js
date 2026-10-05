@@ -85,4 +85,51 @@ const API = {
   challengeSubmission(recordId) {
     return this._req(`/api/challenges/submissions/${recordId}`);
   },
+
+  // ---- 申诉与复核链路 ----
+  // 审核凭证：初审/复核共用 X-Reviewer-Token（缺省入口降级为内置初审员）
+  reviewerMe() { return this._req("/api/challenges/reviewers/me"); },
+  reviewQueueStatus(status) {
+    return this._req(`/api/challenges/review_queue?status=${status}`);
+  },
+  appealsQueue(status = "pending") {
+    return this._req(`/api/challenges/appeals?status=${status}`);
+  },
+  appealSubmission(recordId, player, reason, appealId) {
+    return this._req(`/api/challenges/submissions/${recordId}/appeal`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ player, reason, appeal_id: appealId }),
+    });
+  },
+  decideAppeal(appealId, decision, note, token) {
+    return this._req(`/api/challenges/appeals/${appealId}/decision`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json",
+                 "X-Reviewer-Token": token || "local-moderator" },
+      body: JSON.stringify({ decision, note: note || "" }),
+    });
+  },
+  revokeSubmission(recordId, note, token) {
+    return this._req(`/api/challenges/submissions/${recordId}/revoke`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json",
+                 "X-Reviewer-Token": token || "local-moderator" },
+      body: JSON.stringify({ note: note || "" }),
+    });
+  },
+  restoreSubmission(recordId, note, token) {
+    return this._req(`/api/challenges/submissions/${recordId}/restore`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json",
+                 "X-Reviewer-Token": token || "local-moderator" },
+      body: JSON.stringify({ note: note || "" }),
+    });
+  },
+  submissionTimeline(recordId) {
+    return this._req(`/api/challenges/submissions/${recordId}/timeline`);
+  },
+  mySubmissions(player, challengeId) {
+    const q = challengeId ? `&challenge_id=${challengeId}` : "";
+    return this._req(`/api/challenges/mine/submissions?player=${encodeURIComponent(player)}${q}`);
+  },
 };

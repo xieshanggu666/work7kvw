@@ -5,11 +5,21 @@ window.ChallengeSelect = {
   data() {
     return {
       mode: "list",          // list | publish | review
+      reviewTab: "queue",    // queue=初审 appeals=复核 archive=终审管理 mine=我的成绩
       form: null,
       publishErr: "",
       publishing: false,
       queue: [],
       queueLoading: false,
+      appeals: [],
+      archive: [],
+      archiveStatus: "approved",
+      mine: [],
+      minePlayer: Store.get("pilot") || "",
+      timeline: null,
+      timelineLoading: false,
+      moderatorToken: Store.get("modToken") || "local-moderator",
+      actionErr: "",
     };
   },
   computed: {
@@ -33,6 +43,36 @@ window.ChallengeSelect = {
       const d = new Date(ts * 1000);
       const p = n => String(n).padStart(2, "0");
       return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+    },
+    fmtDateTime(ts) {
+      if (!ts) return "";
+      const d = new Date(ts * 1000);
+      const p = n => String(n).padStart(2, "0");
+      return `${this.fmtDate(ts)} ${p(d.getHours())}:${p(d.getMinutes())}`;
+    },
+    statusLabel(s) {
+      return { pending: "待审核", approved: "已上榜", rejected: "已驳回",
+               revoked: "已撤销" }[s] || s;
+    },
+    statusClass(s) {
+      return { pending: "tag-pending", approved: "tag-ok",
+               rejected: "tag-bad", revoked: "tag-warn" }[s] || "";
+    },
+    eventLabel(k) {
+      return {
+        submit: "玩家提交", review_approve: "初审通过", review_reject: "初审驳回",
+        appeal: "玩家申诉", appeal_uphold: "复核维持原判",
+        appeal_overturn: "复核推翻·改判通过", revoke: "复核撤销上榜",
+        restore: "复核恢复上榜", legacy: "历史已审核（补登）",
+      }[k] || k;
+    },
+    eventDetail(e) {
+      const d = e.detail || {};
+      if (e.kind === "submit") return `★${d.stars} · 服务端结算`;
+      if (e.kind === "appeal") return `第 ${d.round} 轮（原判 ${this.statusLabel(d.from_status)}）：${d.reason || ""}`;
+      if (e.kind === "appeal_uphold" || e.kind === "appeal_overturn")
+        return `第 ${d.round} 轮${d.note ? "：" + d.note : ""}`;
+      return d.note || "";
     },
     enter(c) { if (c.unlocked) this.$emit("enter", c); },
 
@@ -115,14 +155,53 @@ window.ChallengeSelect = {
       }
     },
 
-    // ---------- 审核队列 ----------
-    async openReview() {
+    // ---------- 审核 / 申诉 / 复核 ----------
+    async openReview(tab = "queue") {
       this.mode = "review";
+      this.reviewTab = tab;
+      this.actionErr = "";
+      await this.loadReviewTab(tab);
+    },
+    async loadReviewTab(tab) {
+      this.reviewTab = tab;
+      this.queueLoading = true;
+      this.actionErr = "";
+      try {
+        if (tab === "queue") {
+          this.queue = (await API.reviewQueue()).submissions || [];
+        } else if (tab === "appeals") {
+          this.appeals = (await API.appealsQueue("pending")).appeals || [];
+        } else if (tab === "archive") {
+          this.archive = (await API.reviewQueueStatus(this.archiveStatus)).submissions || [];
+        } else if (tab === "mine") {
+          await this.loadMine();
+        }
+      } catch (e) {
+        this.actionErr = e.message;
+        this.queue = []; this.appeals = []; this.archive = [];
+      } finally {
+        this.queueLoading = false;
+      }
+    },
+    async switchArchive(status) {
+      this.archiveStatus = status;
       this.queueLoading = true;
       try {
-        this.queue = (await API.reviewQueue()).submissions || [];
+        this.archive = (await API.reviewQueueStatus(status)).submissions || [];
       } catch (e) {
-        this.queue = [];
+        this.actionErr = e.message;
+      } finally {
+        this.queueLoading = false;
+      }
+    },
+    async loadMine() {
+      this.queueLoading = true;
+      try {
+        this.mine = this.minePlayer
+          ? ((await API.mySubmissions(this.minePlayer)).submissions || []) : [];
+      } catch (e) {
+        this.actionErr = e.message;
+        this.mine = [];
       } finally {
         this.queueLoading = false;
       }
@@ -130,10 +209,80 @@ window.ChallengeSelect = {
     async review(rec, action) {
       try {
         await API.reviewSubmission(rec.record_id, action, rec._note || "");
-        await this.openReview();   // 刷新队列
-        this.$emit("refresh");      // 联动列表：解锁状态 / 待审数 / 最佳成绩
+        await this.loadReviewTab("queue");
+        this.$emit("refresh");
       } catch (e) {
-        alert("审核失败：" + e.message);
+        this.actionErr = "初审失败：" + e.message;
+      }
+    },
+    async decide(ap, decision) {
+      try {
+        await API.decideAppeal(ap.appeal_id, decision, ap._note || "",
+                               this.moderatorToken);
+        await this.loadReviewTab("appeals");
+        this.$emit("refresh");
+      } catch (e) {
+        this.actionErr = "复核裁决失败：" + e.message;
+      }
+    },
+    async revoke(rec) {
+      const note = rec._note || "";
+      if (!window.confirm(`确认撤销该上榜成绩？将立即移出排行榜、关闭回放，并级联回收它解锁的挑战。`)) return;
+      try {
+        const out = await API.revokeSubmission(rec.record_id, note,
+                                               this.moderatorToken);
+        await this.loadReviewTab(this.reviewTab);
+        this.$emit("refresh");
+        this._showRollback(out);
+      } catch (e) {
+        this.actionErr = "撤销失败：" + e.message;
+      }
+    },
+    async restore(rec) {
+      try {
+        await API.restoreSubmission(rec.record_id, rec._note || "",
+                                    this.moderatorToken);
+        await this.loadReviewTab(this.reviewTab);
+        this.$emit("refresh");
+      } catch (e) {
+        this.actionErr = "恢复失败：" + e.message;
+      }
+    },
+    _showRollback(out) {
+      const ch = (out.effects && out.effects.unlock_changes) || [];
+      const locked = ch.filter(c => !c.unlocked);
+      if (locked.length) {
+        this.actionErr = "已撤销；级联回收解锁：" +
+          locked.map(c => `「${c.title}」`).join("、");
+      }
+    },
+    async appeal(rec) {
+      const reason = window.prompt(
+        `对 #${rec.record_id}「${rec.challenge_title}」的${this.statusLabel(rec.review_status)}结果发起申诉（第 ${rec.appeal_rounds + 1} 轮，最多 2 轮）：\n请说明申诉理由，复核员会重新核查服务端结算档案。`,
+        rec._appealReason || "");
+      if (reason === null) return;
+      if (!reason.trim()) { this.actionErr = "申诉理由不能为空"; return; }
+      const appealId = (window.crypto && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : `ap-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      try {
+        await API.appealSubmission(rec.record_id, this.minePlayer,
+                                   reason.trim(), appealId);
+        await this.loadReviewTab("mine");
+        this.$emit("refresh");
+      } catch (e) {
+        this.actionErr = "申诉失败：" + e.message;
+      }
+    },
+    async showTimeline(recordId) {
+      this.timelineLoading = true;
+      this.timeline = null;
+      try {
+        this.timeline = await API.submissionTimeline(recordId);
+      } catch (e) {
+        this.actionErr = "加载审核链路失败：" + e.message;
+      } finally {
+        this.timelineLoading = false;
       }
     },
   },
@@ -282,28 +431,202 @@ window.ChallengeSelect = {
       </div>
     </div>
 
-    <!-- 审核队列 -->
+    <!-- 审核 / 申诉 / 复核工作台 -->
     <div v-if="mode === 'review'" class="form-wrap">
-      <div class="form-panel">
-        <h2>审核队列 <span class="plan-count">通过后进入排行榜、开放回放并联动解锁</span></h2>
-        <p v-if="queueLoading" class="plan-empty">加载中…</p>
-        <p v-else-if="!queue.length" class="plan-empty">没有待审核的飞行记录。</p>
-        <div v-for="r in queue" :key="r.record_id" class="queue-row">
-          <div class="queue-main">
-            <b>#{{ r.challenge_id }} {{ r.challenge_title }}</b>
-            <span class="ver-tag">v{{ r.version }}</span>
-            <div class="queue-meta">
-              {{ r.player }} · ★{{ r.stars }} · {{ kmps(r.fuel_used) }} km/s
-              · {{ Math.round(r.elapsed_days) }} 天 · {{ fmtDate(r.created_at) }}
+      <div class="form-panel review-panel">
+        <h2>审核工作台
+          <span class="plan-count">初审上榜 · 玩家申诉 · 复核撤销/恢复 · 全链路可追溯</span>
+        </h2>
+        <div class="review-tabs">
+          <button :class="{ active: reviewTab === 'queue' }"
+                  @click="loadReviewTab('queue')">🗂 初审队列</button>
+          <button :class="{ active: reviewTab === 'appeals' }"
+                  @click="loadReviewTab('appeals')">⚖ 申诉复核
+            <span v-if="appeals.length" class="badge">{{ appeals.length }}</span></button>
+          <button :class="{ active: reviewTab === 'archive' }"
+                  @click="loadReviewTab('archive')">📜 终审管理</button>
+          <button :class="{ active: reviewTab === 'mine' }"
+                  @click="loadReviewTab('mine')">🧑‍✈️ 我的成绩/申诉</button>
+        </div>
+        <p v-if="actionErr" class="form-err">⚠ {{ actionErr }}</p>
+
+        <!-- 初审队列（含申诉重审条目，标红提示走复核裁决） -->
+        <template v-if="reviewTab === 'queue'">
+          <p v-if="queueLoading" class="plan-empty">加载中…</p>
+          <p v-else-if="!queue.length" class="plan-empty">没有待审核的飞行记录。</p>
+          <div v-for="r in queue" :key="r.record_id" class="queue-row"
+               :class="{ 'appeal-row': r.appeal_open }">
+            <div class="queue-main">
+              <b>#{{ r.challenge_id }} {{ r.challenge_title }}</b>
+              <span class="ver-tag">v{{ r.version }}</span>
+              <span v-if="r.appeal_open" class="appeal-tag">第 {{ r.appeal_round }} 轮申诉复核中</span>
+              <div class="queue-meta">
+                {{ r.player }} · ★{{ r.stars }} · {{ kmps(r.fuel_used) }} km/s
+                · {{ Math.round(r.elapsed_days) }} 天 · {{ fmtDate(r.created_at) }}
+              </div>
+              <div v-if="r.appeal_open" class="queue-meta appeal-reason">
+                申诉理由：{{ r.appeal_reason }}（请在「申诉复核」页裁决，初审不可直接终审）
+              </div>
+            </div>
+            <input class="queue-note" v-model.trim="r._note" maxlength="200"
+                   placeholder="审核备注（可选）" :disabled="!!r.appeal_open">
+            <button class="btn mini approve" :disabled="!!r.appeal_open"
+                    @click="review(r, 'approve')">✓ 通过</button>
+            <button class="btn mini reject" :disabled="!!r.appeal_open"
+                    @click="review(r, 'reject')">✕ 驳回</button>
+            <button class="btn mini ghost" @click="showTimeline(r.record_id)">链路</button>
+          </div>
+        </template>
+
+        <!-- 申诉复核（仅复核员） -->
+        <template v-if="reviewTab === 'appeals'">
+          <label class="mod-token">复核员令牌
+            <input v-model.trim="moderatorToken"
+                   @change="Store.set('modToken', moderatorToken)"
+                   placeholder="local-moderator（本地单机默认）">
+          </label>
+          <p v-if="queueLoading" class="plan-empty">加载中…</p>
+          <p v-else-if="!appeals.length" class="plan-empty">没有待复核的申诉。</p>
+          <div v-for="a in appeals" :key="a.appeal_id" class="queue-row appeal-row">
+            <div class="queue-main">
+              <b>#{{ a.challenge_id }} {{ a.challenge_title }}</b>
+              <span class="ver-tag">v{{ a.version }}</span>
+              <span class="appeal-tag">第 {{ a.round }} 轮申诉 · 原判 {{ statusLabel(a.from_status) }}</span>
+              <div class="queue-meta">
+                {{ a.player }} · ★{{ a.stars }} · {{ kmps(a.fuel_used) }} km/s
+                · {{ Math.round(a.elapsed_days) }} 天
+              </div>
+              <div class="queue-meta appeal-reason">申诉理由：{{ a.reason }}</div>
+            </div>
+            <input class="queue-note" v-model.trim="a._note" maxlength="200"
+                   placeholder="裁决备注（可选）">
+            <button class="btn mini approve" @click="decide(a, 'overturn')">
+              ↺ 推翻·改判通过</button>
+            <button class="btn mini reject" @click="decide(a, 'uphold')">
+              ⊘ 维持原判</button>
+            <button class="btn mini ghost" @click="showTimeline(a.record_id)">链路</button>
+          </div>
+        </template>
+
+        <!-- 终审管理：撤销/恢复上榜成绩 -->
+        <template v-if="reviewTab === 'archive'">
+          <div class="archive-bar">
+            <label class="mod-token">复核员令牌
+              <input v-model.trim="moderatorToken"
+                     @change="Store.set('modToken', moderatorToken)"
+                     placeholder="local-moderator（本地单机默认）">
+            </label>
+            <div class="status-switch">
+              <button :class="{ active: archiveStatus === 'approved' }"
+                      @click="switchArchive('approved')">已上榜</button>
+              <button :class="{ active: archiveStatus === 'revoked' }"
+                      @click="switchArchive('revoked')">已撤销</button>
+              <button :class="{ active: archiveStatus === 'rejected' }"
+                      @click="switchArchive('rejected')">已驳回</button>
             </div>
           </div>
-          <input class="queue-note" v-model.trim="r._note" maxlength="200"
-                 placeholder="审核备注（可选）">
-          <button class="btn mini approve" @click="review(r, 'approve')">✓ 通过</button>
-          <button class="btn mini reject" @click="review(r, 'reject')">✕ 驳回</button>
-        </div>
+          <p v-if="queueLoading" class="plan-empty">加载中…</p>
+          <p v-else-if="!archive.length" class="plan-empty">该状态下暂无成绩。</p>
+          <div v-for="r in archive" :key="r.record_id" class="queue-row">
+            <div class="queue-main">
+              <b>#{{ r.challenge_id }} {{ r.challenge_title }}</b>
+              <span class="ver-tag">v{{ r.version }}</span>
+              <span :class="'status-tag ' + statusClass(r.review_status)">
+                {{ statusLabel(r.review_status) }}</span>
+              <div class="queue-meta">
+                {{ r.player }} · ★{{ r.stars }} · {{ kmps(r.fuel_used) }} km/s
+                · {{ Math.round(r.elapsed_days) }} 天
+                <template v-if="r.reviewed_by"> · 审核 {{ r.reviewed_by }}</template>
+                <template v-if="r.review_note"> · 备注 {{ r.review_note }}</template>
+              </div>
+            </div>
+            <input class="queue-note" v-model.trim="r._note" maxlength="200"
+                   placeholder="复核备注（可选）">
+            <button v-if="r.review_status === 'approved'"
+                    class="btn mini reject" @click="revoke(r)">⤼ 撤销上榜</button>
+            <button v-if="r.review_status === 'revoked'"
+                    class="btn mini approve" @click="restore(r)">↩ 恢复上榜</button>
+            <button class="btn mini ghost" @click="showTimeline(r.record_id)">链路</button>
+          </div>
+        </template>
+
+        <!-- 我的成绩 / 发起申诉 -->
+        <template v-if="reviewTab === 'mine'">
+          <label class="mod-token">飞行员署名
+            <input v-model.trim="minePlayer" maxlength="24"
+                   @change="loadMine()" placeholder="匿名飞行员">
+            <button class="btn mini" @click="Store.set('pilot', minePlayer); loadMine()">
+              查询</button>
+          </label>
+          <p v-if="queueLoading" class="plan-empty">加载中…</p>
+          <p v-else-if="!mine.length" class="plan-empty">
+            还没有提交记录。先进入挑战发射一次吧！
+          </p>
+          <div v-for="r in mine" :key="r.record_id" class="queue-row">
+            <div class="queue-main">
+              <b>#{{ r.challenge_id }} {{ r.challenge_title }}</b>
+              <span class="ver-tag">v{{ r.version }}</span>
+              <span :class="'status-tag ' + statusClass(r.review_status)">
+                {{ statusLabel(r.review_status) }}</span>
+              <span v-if="r.appeal_open" class="appeal-tag">
+                第 {{ r.appeal_rounds }} 轮申诉复核中</span>
+              <div class="queue-meta">
+                ★{{ r.stars }} · {{ kmps(r.fuel_used) }} km/s
+                · {{ Math.round(r.elapsed_days) }} 天 · {{ fmtDate(r.created_at) }}
+              </div>
+              <div v-if="r.review_note" class="queue-meta">审核备注：{{ r.review_note }}</div>
+            </div>
+            <button class="btn mini approve" :disabled="!r.appeal_available"
+                    @click="appeal(r)">
+              {{ r.appeal_rounds >= 2 ? '申诉轮次已用尽'
+                 : (r.appeal_open ? '申诉复核中' : '⚖ 发起申诉（剩 ' + (2 - r.appeal_rounds) + ' 轮）') }}
+            </button>
+            <button class="btn mini ghost" @click="showTimeline(r.record_id)">链路</button>
+          </div>
+        </template>
+
         <div class="form-btns">
           <button class="btn ghost" @click="mode = 'list'">← 返回列表</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 审核链路时间线 -->
+    <div v-if="timeline" class="modal-mask" @click.self="timeline = null">
+      <div class="modal timeline-modal">
+        <h2>🔗 审核链路 · 成绩 #{{ timeline.record_id }}</h2>
+        <p class="modal-reason">
+          #{{ timeline.challenge_id }} {{ timeline.challenge_title }} · v{{ timeline.version }}
+          · {{ timeline.player }} · ★{{ timeline.stars }}
+          · {{ kmps(timeline.fuel_used) }} km/s
+          <span :class="'status-tag ' + statusClass(timeline.review_status)">
+            {{ statusLabel(timeline.review_status) }}</span>
+        </p>
+        <ul class="timeline-list">
+          <li v-for="e in timeline.events" :key="e.seq" class="tl-item">
+            <div class="tl-dot" :class="'dot-' + e.actor_role"></div>
+            <div class="tl-body">
+              <div class="tl-head">
+                <b>{{ eventLabel(e.kind) }}</b>
+                <span class="tl-actor">{{ e.actor || '—' }}（{{
+                  { player: '玩家', reviewer: '初审员', moderator: '复核员',
+                    system: '系统' }[e.actor_role] || e.actor_role }}）</span>
+                <span class="tl-time">{{ fmtDateTime(e.created_at) }}</span>
+              </div>
+              <div v-if="eventDetail(e)" class="tl-detail">{{ eventDetail(e) }}</div>
+            </div>
+          </li>
+        </ul>
+        <div v-if="timeline.appeals && timeline.appeals.length" class="tl-appeals">
+          <div v-for="a in timeline.appeals" :key="a.appeal_id" class="tl-appeal">
+            第 {{ a.round }} 轮：{{ a.reason }}
+            → <b :class="a.status === 'overturn' ? 'ok-text' : 'bad-text'">
+              {{ a.status === 'overturn' ? '推翻原判' : '维持原判' }}</b>
+            <span v-if="a.decided_by">（{{ a.decided_by }}：{{ a.decision_note }}）</span>
+          </div>
+        </div>
+        <div class="modal-btns">
+          <button class="btn ghost" @click="timeline = null">关闭</button>
         </div>
       </div>
     </div>

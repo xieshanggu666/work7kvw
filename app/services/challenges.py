@@ -1,4 +1,4 @@
-"""社区航线挑战服务：版本化发布 / 幂等提交 / 审核 / 排行榜 / 回放 / 解锁联动。
+"""社区航线挑战服务：版本化发布 / 幂等提交 / 审核 / 申诉与复核 / 排行榜 / 回放 / 解锁联动。
 
 设计要点：
 - 版本化：每次发布生成不可变的 ChallengeVersion（预算 + 里程碑 + 时间限制），
@@ -7,11 +7,21 @@
   关联档案落库成绩；重复提交（双击/重试/多标签页）返回首个结果，不重复计数。
 - 审核联动：成绩默认 pending；审核通过（approved）后才进入排行榜、开放轨迹回放，
   并计入解锁条件。解锁状态按规则实时求值，审核通过即自动联动，无需额外迁移。
-- 并发安全：模块级锁串行化提交/审核临界区（SQLite 单写者），唯一约束兜底。
+- 申诉与复核：玩家可对 rejected/revoked 成绩凭 appeal_id 幂等键发起申诉（每成绩
+  至多 2 轮、同时仅 1 条），成绩回到 pending 进入复核队列；复核员（moderator）
+  维持原判(uphold→回到原状态)或推翻原判(overturn→approved)。复核员还可撤销
+  (revoke)/恢复(restore)已上榜成绩；排行榜/回放/解锁全部按状态实时求值，
+  撤销即自动出榜、关闭回放并级联回收解锁，接口返回前后 diff 的回滚效果。
+- 可追溯：每次状态迁移追加一条不可变的 ChallengeReviewEvent（提交/初审/申诉/
+  复核/撤销/恢复）；历史已审核成绩在启动时补登 legacy 事件，链路不断档。
+- 审核权限：Reviewer 分 reviewer（初审）/moderator（复核、撤销、注册）两级，
+  token 经 X-Reviewer-Token 上送；内置本地账号开箱即用，缺省调用降级为内置初审员。
+- 并发安全：模块级锁串行化提交/审核/申诉临界区（SQLite 单写者），唯一约束兜底。
 """
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 import time
 import uuid
@@ -19,12 +29,13 @@ from typing import List, Optional, Tuple
 
 from sqlalchemy.exc import IntegrityError
 
-from app.models import (Challenge, ChallengeRun, ChallengeSubmission,
-                        ChallengeVersion, LevelScore)
+from app.models import (Challenge, ChallengeAppeal, ChallengeReviewEvent,
+                        ChallengeRun, ChallengeSubmission, ChallengeVersion,
+                        LevelScore, Reviewer)
 from app.services import physics
 from app.services.levels import LEVEL_BY_ID
 
-# SQLite 单写者：序列化"查重-插入 / 审核状态迁移"临界区。
+# SQLite 单写者：序列化"查重-插入 / 审核状态迁移 / 申诉复核"临界区。
 _LOCK = threading.Lock()
 
 _KEEP_RULE = object()  # publish_version 的"保留原解锁条件"哨兵
@@ -33,6 +44,30 @@ _PLANET_IDS = {b["id"] for b in physics.BODIES if b["id"] != "sun"}
 _MILESTONE_KINDS = {"proximity", "radius", "assist_capture", "assist_then_radius", "escape"}
 _REVIEW_ACTIONS = {"approve": "approved", "reject": "rejected"}
 DEFAULT_PLAYER = "匿名飞行员"
+
+# 审核状态
+PENDING, APPROVED, REJECTED, REVOKED = "pending", "approved", "rejected", "revoked"
+# 申诉裁决
+APPEAL_PENDING, APPEAL_UPHOLD, APPEAL_OVERTURN = "pending", "uphold", "overturn"
+# 事件类型
+EV_SUBMIT = "submit"
+EV_REVIEW = {"approved": "review_approve", "rejected": "review_reject"}
+EV_APPEAL = "appeal"
+EV_APPEAL_DECISION = {APPEAL_UPHOLD: "appeal_uphold", APPEAL_OVERTURN: "appeal_overturn"}
+EV_REVOKE = "revoke"
+EV_RESTORE = "restore"
+EV_LEGACY = "legacy"
+
+ROLE_REVIEWER = "reviewer"
+ROLE_MODERATOR = "moderator"
+MAX_APPEAL_ROUNDS = 2
+MAX_APPEAL_REASON = 500
+
+# 内置审核账号（本地单机开箱即用；正式部署可禁用/改 token）
+BUILTIN_REVIEWERS = [
+    {"name": "本机初审员", "token": "local-reviewer", "role": ROLE_REVIEWER},
+    {"name": "本机复核员", "token": "local-moderator", "role": ROLE_MODERATOR},
+]
 
 
 # ---------- 异常 ----------
@@ -66,7 +101,27 @@ class ChallengeLocked(PermissionError):
 
 
 class ReviewConflict(RuntimeError):
-    """成绩已终审，不能再次审核。"""
+    """成绩已终审或申诉链路状态冲突，不能执行该动作。"""
+
+
+class UnauthorizedReviewer(PermissionError):
+    """缺少有效的审核凭证（401）。"""
+
+
+class ForbiddenReviewer(PermissionError):
+    """审核账号权限不足（403）。"""
+
+
+class AppealNotFound(KeyError):
+    """申诉单不存在。"""
+
+
+class AppealConflict(RuntimeError):
+    """已有进行中的申诉 / 申诉轮次用尽 / 当前状态不能申诉。"""
+
+
+class ReviewerConflict(ValueError):
+    """审核员署名或 token 冲突。"""
 
 
 # ---------- 定义校验 ----------
@@ -479,68 +534,645 @@ def submit(db, *, challenge_id: int, run_id: str, submission_id: Optional[str],
                      .filter(ChallengeSubmission.submission_id == rec.submission_id)
                      .first())
             return _submitted_response(dup, duplicated=True)
+        _add_event(db, rec, kind=EV_SUBMIT, actor=rec.player,
+                   actor_role="player",
+                   detail={"submission_id": rec.submission_id,
+                           "challenge_id": rec.challenge_id, "version": rec.version,
+                           "stars": rec.stars, "fuel_used": rec.fuel_used})
         db.commit()
         return _submitted_response(rec, duplicated=False)
 
 
+# ---------- 审核权限 / 历史兼容 ----------
+
+def _sqlite_migrate(db) -> None:
+    """对旧库做增量列迁移（SQLite ALTER TABLE ADD COLUMN，幂等）。"""
+    bind = db.get_bind()
+    try:
+        url = bind.url
+    except Exception:
+        url = None
+    if url is None or not str(url).startswith("sqlite"):
+        return
+    path = url.database
+    conn = sqlite3.connect(path)
+    try:
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(challenge_submission)").fetchall()}
+        if cols and "reviewed_by" not in cols:
+            conn.execute(
+                "ALTER TABLE challenge_submission ADD COLUMN reviewed_by VARCHAR(24)")
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def _seed_reviewers(db) -> None:
+    """确保内置审核账号存在（同名不覆盖 token，避免破坏既有授权）。"""
+    existing = {r.name: r for r in db.query(Reviewer).all()}
+    added = False
+    for spec in BUILTIN_REVIEWERS:
+        if spec["name"] not in existing:
+            db.add(Reviewer(name=spec["name"], token=spec["token"],
+                            role=spec["role"], active=1))
+            added = True
+    if added:
+        db.commit()
+
+
+def _backfill_legacy_events(db) -> None:
+    """兼容已审核历史成绩：为没有事件档案的已终审成绩补登 legacy 事件。"""
+    fin = (db.query(ChallengeSubmission)
+             .filter(ChallengeSubmission.review_status.in_((APPROVED, REJECTED)))
+             .all())
+    if not fin:
+        return
+    with_events = {
+        sid for (sid,) in db.query(ChallengeReviewEvent.submission_id).distinct().all()
+    }
+    n = 0
+    for rec in fin:
+        if rec.id in with_events:
+            continue
+        _add_event(db, rec, kind=EV_LEGACY,
+                   actor=rec.reviewed_by or "历史审核",
+                   actor_role="system",
+                   detail={"status": rec.review_status,
+                           "note": rec.review_note or "",
+                           "reviewed_at": rec.reviewed_at})
+        n += 1
+    if n:
+        db.commit()
+
+
+_BOOTSTRAP_LOCK = threading.Lock()
+_BOOTSTRAPPED = False
+
+
+def bootstrap(db) -> None:
+    """启动引导：旧库加列迁移 + 内置审核账号 + 历史成绩事件补登（幂等）。
+
+    不持有业务 _LOCK：迁移会打开第二个 SQLite 连接（ALTER TABLE），
+    若在 _LOCK 临界区内、且主连接已开启写事务时执行会与写锁互锁。
+    """
+    global _BOOTSTRAPPED
+    with _BOOTSTRAP_LOCK:
+        if _BOOTSTRAPPED:
+            return
+        _sqlite_migrate(db)
+        _seed_reviewers(db)
+        _backfill_legacy_events(db)
+        _BOOTSTRAPPED = True
+
+
+def reset_bootstrap_for_tests() -> None:
+    """测试夹具用：换库后允许再次执行启动引导。"""
+    global _BOOTSTRAPPED
+    _BOOTSTRAPPED = False
+
+
+def authenticate(db, token: Optional[str], *, required_role: Optional[str] = None):
+    """校验审核凭证，返回 Reviewer；缺省 token 降级为内置初审员（本地单机开放入口）。
+
+    required_role=moderator 时必须显式提供复核员 token：
+    无 token/失效 → UnauthorizedReviewer(401)；初审员越权 → ForbiddenReviewer(403)。
+    bootstrap 必须在调用方获取 _LOCK 之前完成（见 bootstrap 文档说明）。
+    """
+    bootstrap(db)
+    if not token:
+        if required_role == ROLE_MODERATOR:
+            raise UnauthorizedReviewer("该操作需要复核员权限，请提供 X-Reviewer-Token")
+        return db.query(Reviewer).filter(Reviewer.token == "local-reviewer").one()
+    rv = (db.query(Reviewer)
+            .filter(Reviewer.token == token, Reviewer.active == 1)
+            .first())
+    if rv is None:
+        raise UnauthorizedReviewer("审核凭证无效或已停用")
+    if required_role == ROLE_MODERATOR and rv.role != ROLE_MODERATOR:
+        raise ForbiddenReviewer(f"「{rv.name}」是初审员，该操作需要复核员权限")
+    return rv
+
+
+def register_reviewer(db, *, token: str, name: str, role: str,
+                      actor: Reviewer) -> dict:
+    """复核员注册新的审核账号（仅 moderator 可调用）。"""
+    name = _clean_text(name, 24, "审核员署名")
+    token = _clean_text(token, 64, "审核令牌")
+    if role not in (ROLE_REVIEWER, ROLE_MODERATOR):
+        raise ValidationError(f"未知角色: {role}")
+    rv = Reviewer(name=name, token=token, role=role, active=1, created_at=time.time())
+    db.add(rv)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise ReviewerConflict("审核员署名或令牌已存在")
+    return {"id": rv.id, "name": rv.name, "role": rv.role}
+
+
+# ---------- 事件档案 ----------
+
+def _add_event(db, rec, *, kind: str, actor: str = "",
+               actor_role: str = "", detail: Optional[dict] = None,
+               appeal=None) -> ChallengeReviewEvent:
+    ev = ChallengeReviewEvent(
+        submission_id=rec.id,
+        appeal_id=appeal.id if appeal is not None else None,
+        kind=kind, actor=(actor or "")[:24], actor_role=actor_role,
+        detail_json=json.dumps(detail or {}, ensure_ascii=False),
+        created_at=time.time())
+    db.add(ev)
+    return ev
+
+
+# ---------- 排行榜/解锁联动效果（回滚可观测） ----------
+
+def _snapshot_effects(db) -> dict:
+    """操作前快照：各挑战是否在榜（本人最佳 approved）+ 全部挑战解锁状态。"""
+    best = _best_approved(db)
+    builtin, ch_stars, total, titles = _unlock_context(db)
+    unlocked = {}
+    for ch in db.query(Challenge).filter(Challenge.status != "archived").all():
+        ok, _ = _unlock_state(_rule_of(ch), builtin, ch_stars, total, titles)
+        unlocked[ch.id] = ok
+    return {"best": best, "unlocked": unlocked, "titles": titles}
+
+
+def _effects(db, before: dict, rec: ChallengeSubmission, *,
+             replayable_before: bool) -> dict:
+    """汇总一条成绩操作对排行榜/回放/解锁的联动效果（供回滚审计）。"""
+    best_now = _best_approved(db)
+    on_board = bool(
+        best_now.get(rec.challenge_id)
+        and best_now[rec.challenge_id]["record_id"] == rec.id
+        and rec.review_status == APPROVED)
+    builtin, ch_stars, total, titles = _unlock_context(db)
+    unlocked_now, desc = {}, {}
+    for ch in db.query(Challenge).filter(Challenge.status != "archived").all():
+        ok, why = _unlock_state(_rule_of(ch), builtin, ch_stars, total, titles)
+        unlocked_now[ch.id] = ok
+        desc[ch.id] = why
+    changes = []
+    for cid, was_unlocked in before["unlocked"].items():
+        if was_unlocked != unlocked_now.get(cid):
+            changes.append({
+                "challenge_id": cid,
+                "title": before["titles"].get(cid, f"#{cid}"),
+                "unlocked": unlocked_now[cid],
+                "unlock_desc": desc.get(cid),
+            })
+    return {
+        "record_id": rec.id,
+        "status": rec.review_status,
+        "leaderboard": {
+            "on_board": on_board,
+            "best_record_id": (best_now.get(rec.challenge_id) or {}).get("record_id"),
+        },
+        "replayable": {"before": replayable_before,
+                       "after": rec.review_status == APPROVED},
+        "unlock_changes": changes,
+    }
+
+
 # ---------- 审核 ----------
 
-def review(db, *, record_id: int, action: str, note: str = "") -> dict:
-    """审核状态机：pending → approved / rejected。
+def review(db, *, record_id: int, action: str, note: str = "",
+           reviewer_token: Optional[str] = None) -> dict:
+    """初审状态机：pending → approved / rejected（需要初审员权限）。
 
+    申诉重审中的 pending 成绩不能在此直接终审（请走复核裁决接口）。
     幂等：重复同一终审动作返回当前状态（duplicated=True）；
     已终审的成绩再作相反动作 → ReviewConflict(409)。
     """
     if action not in _REVIEW_ACTIONS:
         raise ValidationError(f"未知审核动作: {action}")
     target = _REVIEW_ACTIONS[action]
+    rv = authenticate(db, reviewer_token, required_role=ROLE_REVIEWER)
     with _LOCK:
         rec = (db.query(ChallengeSubmission)
                  .filter(ChallengeSubmission.id == record_id)
                  .first())
         if rec is None:
             raise SubmissionNotFound(f"成绩记录不存在: {record_id}")
+        before = _snapshot_effects(db)
+        replay_before = rec.review_status == APPROVED
+        open_appeal = _open_appeal(db, rec.id)
         if rec.review_status == target:
-            return {"record_id": rec.id, "challenge_id": rec.challenge_id,
-                    "version": rec.version, "review_status": target,
-                    "duplicated": True}
-        if rec.review_status != "pending":
+            return _review_response(rec, target, duplicated=True,
+                                    actor=rv.name, effects=_effects(
+                                        db, before, rec, replayable_before=replay_before))
+        if rec.review_status != PENDING:
             raise ReviewConflict(
                 f"成绩已审核（{rec.review_status}），不能重复审核")
+        if open_appeal is not None:
+            raise ReviewConflict(
+                "成绩正在申诉复核中，请通过复核裁决（uphold/overturn）处理")
         rec.review_status = target
         rec.review_note = (note or "").strip()[:200]
+        rec.reviewed_by = rv.name
         rec.reviewed_at = time.time()
+        _add_event(db, rec, kind=EV_REVIEW[target], actor=rv.name,
+                   actor_role=ROLE_REVIEWER,
+                   detail={"note": rec.review_note})
         db.commit()
-        return {"record_id": rec.id, "challenge_id": rec.challenge_id,
-                "version": rec.version, "review_status": target,
-                "duplicated": False}
+        return _review_response(rec, target, duplicated=False,
+                                actor=rv.name,
+                                effects=_effects(db, before, rec,
+                                                 replayable_before=replay_before))
+
+
+def _review_response(rec, status, *, duplicated: bool, actor: str,
+                     effects: Optional[dict] = None) -> dict:
+    return {"record_id": rec.id, "challenge_id": rec.challenge_id,
+            "version": rec.version, "review_status": status,
+            "reviewed_by": actor, "duplicated": duplicated,
+            "effects": effects}
+
+
+def revoke(db, *, record_id: int, note: str = "",
+           moderator_token: Optional[str] = None) -> dict:
+    """复核员撤销已上榜成绩：approved → revoked。
+
+    自动回滚：立即移出排行榜、关闭轨迹回放，并级联回收该成绩解锁的挑战
+    （解锁状态实时求值，后续有其他成绩补上时会自动重新开放）。
+    幂等：重复撤销返回 duplicated=True；非 approved 状态 → ReviewConflict(409)。
+    """
+    rv = authenticate(db, moderator_token, required_role=ROLE_MODERATOR)
+    with _LOCK:
+        rec = _get_submission(db, record_id)
+        before = _snapshot_effects(db)
+        replay_before = rec.review_status == APPROVED
+        if rec.review_status == REVOKED:
+            return _moderation_response(rec, EV_REVOKE, duplicated=True,
+                                        actor=rv.name,
+                                        effects=_effects(db, before, rec,
+                                                         replayable_before=replay_before))
+        if rec.review_status != APPROVED:
+            raise ReviewConflict(
+                f"只有已通过的成绩可以撤销（当前 {rec.review_status}）")
+        if _open_appeal(db, rec.id) is not None:
+            raise ReviewConflict("成绩正在申诉复核中，不能撤销")
+        _reject_terminal(db, rec, status=REVOKED, note=note, reviewer=rv,
+                         kind=EV_REVOKE)
+        db.commit()
+        return _moderation_response(rec, EV_REVOKE, duplicated=False,
+                                    actor=rv.name,
+                                    effects=_effects(db, before, rec,
+                                                     replayable_before=replay_before))
+
+
+def restore(db, *, record_id: int, note: str = "",
+            moderator_token: Optional[str] = None) -> dict:
+    """复核员恢复被撤销的成绩：revoked → approved（重新上榜/回放/解锁）。
+
+    幂等：已 approved 返回 duplicated=True；其他状态 → ReviewConflict(409)。
+    """
+    rv = authenticate(db, moderator_token, required_role=ROLE_MODERATOR)
+    with _LOCK:
+        rec = _get_submission(db, record_id)
+        before = _snapshot_effects(db)
+        replay_before = rec.review_status == APPROVED
+        if rec.review_status == APPROVED:
+            return _moderation_response(rec, EV_RESTORE, duplicated=True,
+                                        actor=rv.name,
+                                        effects=_effects(db, before, rec,
+                                                         replayable_before=replay_before))
+        if rec.review_status != REVOKED:
+            raise ReviewConflict(
+                f"只有已撤销的成绩可以恢复（当前 {rec.review_status}）")
+        rec.review_status = APPROVED
+        rec.review_note = (note or "").strip()[:200]
+        rec.reviewed_by = rv.name
+        rec.reviewed_at = time.time()
+        _add_event(db, rec, kind=EV_RESTORE, actor=rv.name,
+                   actor_role=ROLE_MODERATOR,
+                   detail={"note": rec.review_note})
+        db.commit()
+        return _moderation_response(rec, EV_RESTORE, duplicated=False,
+                                    actor=rv.name,
+                                    effects=_effects(db, before, rec,
+                                                     replayable_before=replay_before))
+
+
+def _moderation_response(rec, action_kind, *, duplicated: bool, actor: str,
+                         effects: dict) -> dict:
+    return {"record_id": rec.id, "challenge_id": rec.challenge_id,
+            "version": rec.version, "action": action_kind,
+            "review_status": rec.review_status,
+            "reviewed_by": actor, "duplicated": duplicated,
+            "effects": effects}
+
+
+def _reject_terminal(db, rec, *, status: str, note: str, reviewer: Reviewer,
+                     kind: str) -> None:
+    rec.review_status = status
+    rec.review_note = (note or "").strip()[:200]
+    rec.reviewed_by = reviewer.name
+    rec.reviewed_at = time.time()
+    _add_event(db, rec, kind=kind, actor=reviewer.name,
+               actor_role=ROLE_MODERATOR, detail={"note": rec.review_note})
+
+
+def _get_submission(db, record_id: int) -> ChallengeSubmission:
+    rec = (db.query(ChallengeSubmission)
+             .filter(ChallengeSubmission.id == record_id)
+             .first())
+    if rec is None:
+        raise SubmissionNotFound(f"成绩记录不存在: {record_id}")
+    return rec
+
+
+def _open_appeal(db, record_id: int) -> Optional[ChallengeAppeal]:
+    return (db.query(ChallengeAppeal)
+              .filter(ChallengeAppeal.submission_id == record_id,
+                      ChallengeAppeal.status == APPEAL_PENDING)
+              .first())
+
+
+# ---------- 玩家申诉 ----------
+
+def create_appeal(db, *, record_id: int, player: str, reason: str,
+                  appeal_id: Optional[str]) -> dict:
+    """玩家对驳回/撤销的成绩发起申诉（幂等：appeal_id 去重）。
+
+    约束：署名须与提交者一致（仅本人可申诉）；仅 rejected/revoked 可申诉；
+    每条成绩最多 MAX_APPEAL_ROUNDS 轮，同时仅一条待裁决申诉。
+    受理后成绩回到 pending（标注申诉轮次）进入复核队列，等待复核员裁决。
+    """
+    player = (player or "").strip()[:24] or DEFAULT_PLAYER
+    reason = (reason or "").strip()
+    if not reason:
+        raise ValidationError("申诉理由不能为空")
+    if len(reason) > MAX_APPEAL_REASON:
+        raise ValidationError(f"申诉理由过长（≤{MAX_APPEAL_REASON} 字）")
+    with _LOCK:
+        # 幂等重放：同一申诉已受理 → 返回首个结果
+        if appeal_id:
+            dup = (db.query(ChallengeAppeal)
+                     .filter(ChallengeAppeal.appeal_uid == appeal_id)
+                     .first())
+            if dup is not None:
+                return _appeal_response(dup, duplicated=True)
+        rec = _get_submission(db, record_id)
+        if rec.player != player:
+            raise ForbiddenReviewer("只有提交该成绩的玩家本人可以申诉")
+        if rec.review_status not in (REJECTED, REVOKED):
+            raise AppealConflict(
+                f"当前状态（{rec.review_status}）不能申诉，仅驳回/撤销的成绩可申诉")
+        if _open_appeal(db, rec.id) is not None:
+            raise AppealConflict("该成绩已有进行中的申诉，请等待复核裁决")
+        rounds = (db.query(ChallengeAppeal)
+                    .filter(ChallengeAppeal.submission_id == rec.id)
+                    .count())
+        if rounds >= MAX_APPEAL_ROUNDS:
+            raise AppealConflict(f"每条成绩最多申诉 {MAX_APPEAL_ROUNDS} 次")
+        appeal = ChallengeAppeal(
+            appeal_uid=appeal_id or uuid.uuid4().hex,
+            submission_id=rec.id, round=rounds + 1,
+            from_status=rec.review_status, player=player,
+            reason=reason, status=APPEAL_PENDING,
+            created_at=time.time())
+        db.add(appeal)
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            dup = (db.query(ChallengeAppeal)
+                     .filter(ChallengeAppeal.appeal_uid == appeal.appeal_uid)
+                     .first())
+            return _appeal_response(dup, duplicated=True)
+        # 成绩回到待复核队列；排行榜/回放/解锁因状态变化自动回滚
+        rec.review_status = PENDING
+        _add_event(db, rec, kind=EV_APPEAL, actor=player, actor_role="player",
+                   detail={"round": appeal.round,
+                           "from_status": appeal.from_status,
+                           "reason": reason}, appeal=appeal)
+        db.commit()
+        return _appeal_response(appeal, duplicated=False)
+
+
+def decide_appeal(db, *, appeal_id_key: int, decision: str, note: str = "",
+                  moderator_token: Optional[str] = None) -> dict:
+    """复核员裁决申诉：uphold=维持原判（成绩回到 from_status）；
+    overturn=推翻原判（改判通过 approved，重新上榜/回放/解锁）。
+
+    幂等：对已裁决申诉重复同一裁决返回 duplicated=True；
+    相反裁决 → ReviewConflict(409)。
+    """
+    if decision not in (APPEAL_UPHOLD, APPEAL_OVERTURN):
+        raise ValidationError(f"未知复核裁决: {decision}（uphold/overturn）")
+    rv = authenticate(db, moderator_token, required_role=ROLE_MODERATOR)
+    with _LOCK:
+        appeal = (db.query(ChallengeAppeal)
+                    .filter(ChallengeAppeal.id == appeal_id_key)
+                    .first())
+        if appeal is None:
+            raise AppealNotFound(f"申诉记录不存在: {appeal_id_key}")
+        rec = _get_submission(db, appeal.submission_id)
+        before = _snapshot_effects(db)
+        replay_before = rec.review_status == APPROVED
+        if appeal.status != APPEAL_PENDING:
+            decided = "overturn" if appeal.status == APPEAL_OVERTURN else "uphold"
+            if decided == decision:
+                return _appeal_decision_response(
+                    appeal, rec, decision, duplicated=True, actor=rv.name,
+                    effects=_effects(db, before, rec,
+                                     replayable_before=replay_before))
+            raise ReviewConflict(
+                f"申诉已裁决（{decided}），不能改判")
+        appeal.status = decision
+        appeal.decision_note = (note or "").strip()[:200]
+        appeal.decided_by = rv.name
+        appeal.decided_at = time.time()
+        rec.review_status = (
+            APPROVED if decision == APPEAL_OVERTURN else appeal.from_status)
+        rec.review_note = appeal.decision_note
+        rec.reviewed_by = rv.name
+        rec.reviewed_at = time.time()
+        _add_event(db, rec, kind=EV_APPEAL_DECISION[decision], actor=rv.name,
+                   actor_role=ROLE_MODERATOR,
+                   detail={"round": appeal.round,
+                           "from_status": appeal.from_status,
+                           "note": appeal.decision_note},
+                   appeal=appeal)
+        db.commit()
+        return _appeal_decision_response(
+            appeal, rec, decision, duplicated=False, actor=rv.name,
+            effects=_effects(db, before, rec,
+                             replayable_before=replay_before))
+
+
+def _appeal_response(ap: ChallengeAppeal, *, duplicated: bool) -> dict:
+    return {"saved": True, "duplicated": duplicated,
+            "appeal_id": ap.id, "appeal_uid": ap.appeal_uid,
+            "record_id": ap.submission_id, "round": ap.round,
+            "from_status": ap.from_status, "status": ap.status,
+            "review_status": PENDING}
+
+
+def _appeal_decision_response(ap, rec, decision, *, duplicated: bool,
+                              actor: str, effects: dict) -> dict:
+    return {"appeal_id": ap.id, "record_id": rec.id,
+            "challenge_id": rec.challenge_id, "version": rec.version,
+            "decision": decision, "status": decision,
+            "review_status": rec.review_status,
+            "reviewed_by": actor, "round": ap.round,
+            "duplicated": duplicated, "effects": effects}
+
+
+def list_appeals(db, *, status: str = APPEAL_PENDING,
+                 limit: int = 50) -> List[dict]:
+    """申诉队列：默认待复核（moderator 工作流）。"""
+    q = db.query(ChallengeAppeal)
+    if status in (APPEAL_PENDING, APPEAL_UPHOLD, APPEAL_OVERTURN):
+        q = q.filter(ChallengeAppeal.status == status)
+    rows = (q.order_by(ChallengeAppeal.id.desc())
+             .limit(max(1, min(200, limit))).all())
+    sub_ids = {a.submission_id for a in rows}
+    subs = {s.id: s for s in
+            (db.query(ChallengeSubmission)
+               .filter(ChallengeSubmission.id.in_(sub_ids)).all())} if sub_ids else {}
+    titles = {c.id: c.title for c in db.query(Challenge).all()}
+    out = []
+    for a in rows:
+        s = subs.get(a.submission_id)
+        out.append({
+            "appeal_id": a.id, "record_id": a.submission_id,
+            "challenge_id": s.challenge_id if s else None,
+            "challenge_title": titles.get(s.challenge_id, f"#{s.challenge_id}")
+                               if s else "",
+            "version": s.version if s else None,
+            "player": a.player, "round": a.round,
+            "from_status": a.from_status, "status": a.status,
+            "reason": a.reason, "decision_note": a.decision_note,
+            "decided_by": a.decided_by,
+            "stars": s.stars if s else None,
+            "fuel_used": s.fuel_used if s else None,
+            "elapsed_days": s.elapsed_days if s else None,
+            "created_at": a.created_at, "decided_at": a.decided_at,
+        })
+    return out
+
+
+def player_submissions(db, player: str, *, challenge_id: Optional[int] = None,
+                       limit: int = 50) -> List[dict]:
+    """按飞行员署名查询本人提交（玩家查看审核状态/入口申诉用）。"""
+    player = (player or "").strip()[:24] or DEFAULT_PLAYER
+    q = db.query(ChallengeSubmission).filter(ChallengeSubmission.player == player)
+    if challenge_id is not None:
+        q = q.filter(ChallengeSubmission.challenge_id == challenge_id)
+    rows = (q.order_by(ChallengeSubmission.id.desc())
+             .limit(max(1, min(200, limit))).all())
+    titles = {c.id: c.title for c in db.query(Challenge).all()}
+    out = []
+    for r in rows:
+        ap = _open_appeal(db, r.id)
+        rounds = (db.query(ChallengeAppeal)
+                    .filter(ChallengeAppeal.submission_id == r.id).count())
+        out.append({
+            "record_id": r.id, "challenge_id": r.challenge_id,
+            "challenge_title": titles.get(r.challenge_id, f"#{r.challenge_id}"),
+            "version": r.version, "stars": r.stars,
+            "fuel_used": r.fuel_used, "elapsed_days": r.elapsed_days,
+            "review_status": r.review_status, "review_note": r.review_note,
+            "reviewed_by": r.reviewed_by,
+            "appeal_rounds": rounds,
+            "appeal_open": ap.id if ap else None,
+            "appeal_available": (
+                r.review_status in (REJECTED, REVOKED)
+                and ap is None and rounds < MAX_APPEAL_ROUNDS),
+            "replayable": r.review_status == APPROVED,
+            "created_at": r.created_at,
+        })
+    return out
+
+
+# ---------- 可追溯时间线 ----------
+
+def submission_timeline(db, record_id: int) -> Optional[dict]:
+    """成绩全链路：提交 → 初审 → 申诉 → 复核 → 撤销/恢复（事件档案顺序回放）。"""
+    rec = (db.query(ChallengeSubmission)
+             .filter(ChallengeSubmission.id == record_id)
+             .first())
+    if rec is None:
+        return None
+    ch = db.query(Challenge).filter(Challenge.id == rec.challenge_id).first()
+    events = (db.query(ChallengeReviewEvent)
+                .filter(ChallengeReviewEvent.submission_id == rec.id)
+                .order_by(ChallengeReviewEvent.id)
+                .all())
+    appeals = (db.query(ChallengeAppeal)
+                 .filter(ChallengeAppeal.submission_id == rec.id)
+                 .order_by(ChallengeAppeal.id)
+                 .all())
+    return {
+        "record_id": rec.id,
+        "challenge_id": rec.challenge_id,
+        "challenge_title": ch.title if ch else f"#{rec.challenge_id}",
+        "version": rec.version, "player": rec.player,
+        "stars": rec.stars, "fuel_used": rec.fuel_used,
+        "elapsed_days": rec.elapsed_days,
+        "review_status": rec.review_status, "review_note": rec.review_note,
+        "reviewed_by": rec.reviewed_by,
+        "appeal_rounds": len(appeals),
+        "appeal_open": _open_appeal(db, rec.id) is not None,
+        "appeal_available": (
+            rec.review_status in (REJECTED, REVOKED)
+            and _open_appeal(db, rec.id) is None
+            and len(appeals) < MAX_APPEAL_ROUNDS),
+        "replayable": rec.review_status == APPROVED,
+        "created_at": rec.created_at,
+        "events": [{
+            "seq": i + 1, "kind": e.kind, "actor": e.actor,
+            "actor_role": e.actor_role, "appeal_id": e.appeal_id,
+            "detail": json.loads(e.detail_json),
+            "created_at": e.created_at,
+        } for i, e in enumerate(events)],
+        "appeals": [{
+            "appeal_id": a.id, "round": a.round, "from_status": a.from_status,
+            "reason": a.reason, "status": a.status,
+            "decision_note": a.decision_note, "decided_by": a.decided_by,
+            "created_at": a.created_at, "decided_at": a.decided_at,
+        } for a in appeals],
+    }
 
 
 def list_submissions(db, *, challenge_id: Optional[int] = None,
                      status: str = "pending", limit: int = 50) -> List[dict]:
-    """成绩提交列表：默认待审核队列（审核工作流），可按挑战过滤。"""
+    """成绩提交列表：默认待审核队列（含申诉重审，附 appeal 标记），可按挑战过滤。"""
     q = db.query(ChallengeSubmission)
     if challenge_id is not None:
         q = q.filter(ChallengeSubmission.challenge_id == challenge_id)
-    if status in ("pending", "approved", "rejected"):
+    if status in ("pending", "approved", "rejected", "revoked"):
         q = q.filter(ChallengeSubmission.review_status == status)
     rows = (q.order_by(ChallengeSubmission.id.desc())
              .limit(max(1, min(200, limit)))
              .all())
     titles = {c.id: c.title for c in db.query(Challenge).all()}
-    return [{
-        "record_id": r.id,
-        "challenge_id": r.challenge_id,
-        "challenge_title": titles.get(r.challenge_id, f"#{r.challenge_id}"),
-        "version": r.version,
-        "player": r.player,
-        "stars": r.stars,
-        "fuel_used": r.fuel_used,
-        "elapsed_days": r.elapsed_days,
-        "review_status": r.review_status,
-        "review_note": r.review_note,
-        "created_at": r.created_at,
-    } for r in rows]
+    result = []
+    for r in rows:
+        ap = _open_appeal(db, r.id)
+        rounds = (db.query(ChallengeAppeal)
+                    .filter(ChallengeAppeal.submission_id == r.id).count())
+        result.append({
+            "record_id": r.id,
+            "challenge_id": r.challenge_id,
+            "challenge_title": titles.get(r.challenge_id, f"#{r.challenge_id}"),
+            "version": r.version,
+            "player": r.player,
+            "stars": r.stars,
+            "fuel_used": r.fuel_used,
+            "elapsed_days": r.elapsed_days,
+            "review_status": r.review_status,
+            "review_note": r.review_note,
+            "reviewed_by": r.reviewed_by,
+            "appeal_open": ap.id if ap else None,
+            "appeal_round": ap.round if ap else None,
+            "appeal_reason": ap.reason if ap else None,
+            "appeal_rounds_total": rounds,
+            "created_at": r.created_at,
+        })
+    return result
 
 
 # ---------- 排行榜与回放 ----------
@@ -590,6 +1222,9 @@ def submission_detail(db, record_id: int) -> Optional[dict]:
              .first())
     if rec is None:
         return None
+    open_ap = _open_appeal(db, rec.id)
+    rounds = (db.query(ChallengeAppeal)
+                .filter(ChallengeAppeal.submission_id == rec.id).count())
     detail = {
         "record_id": rec.id,
         "challenge_id": rec.challenge_id,
@@ -600,6 +1235,12 @@ def submission_detail(db, record_id: int) -> Optional[dict]:
         "elapsed_days": rec.elapsed_days,
         "review_status": rec.review_status,
         "review_note": rec.review_note,
+        "reviewed_by": rec.reviewed_by,
+        "appeal_rounds": rounds,
+        "appeal_open": open_ap.id if open_ap else None,
+        "appeal_available": (
+            rec.review_status in (REJECTED, REVOKED)
+            and open_ap is None and rounds < MAX_APPEAL_ROUNDS),
         "replayable": rec.review_status == "approved",
         "created_at": rec.created_at,
     }

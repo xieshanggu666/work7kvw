@@ -1,5 +1,5 @@
-"""社区航线挑战 API：版本化发布 / 飞行记录幂等提交 / 审核 / 排行榜与回放 / 解锁联动。"""
-from fastapi import APIRouter, HTTPException
+"""社区航线挑战 API：版本化发布 / 飞行记录幂等提交 / 审核 / 申诉与复核 / 排行榜与回放 / 解锁联动。"""
+from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Optional
 
@@ -64,6 +64,31 @@ class ReviewIn(BaseModel):
     note: Optional[str] = ""
 
 
+class AppealIn(BaseModel):
+    """玩家申诉：署名须与提交一致；appeal_id 为幂等键。"""
+    player: str
+    reason: str
+    appeal_id: Optional[str] = None
+
+
+class AppealDecisionIn(BaseModel):
+    """复核员裁决：uphold=维持原判 / overturn=推翻改判通过。"""
+    decision: str
+    note: Optional[str] = ""
+
+
+class ModerationIn(BaseModel):
+    """复核员撤销(revoke)/恢复(restore)上榜成绩。"""
+    note: Optional[str] = ""
+
+
+class ReviewerIn(BaseModel):
+    """复核员注册新审核账号。"""
+    name: str
+    token: str
+    role: str = "reviewer"      # reviewer / moderator
+
+
 def _dump(model) -> dict:
     """pydantic v1/v2 兼容的 dict 导出（剔除未提供的字段）。"""
     if hasattr(model, "model_dump"):
@@ -92,13 +117,25 @@ def _sim_dict(r: dict, challenge_id: int, version: int) -> dict:
     }
 
 
+def _token(v) -> Optional[str]:
+    """直接函数调用（测试）时 Header 参数未解析为 FieldInfo，归一化为 None。"""
+    return v if isinstance(v, str) else None
+
+
 def _error(e: Exception) -> HTTPException:
     if isinstance(e, (ch_svc.ChallengeNotFound, ch_svc.VersionNotFound,
-                      ch_svc.RunNotFound, ch_svc.SubmissionNotFound)):
+                      ch_svc.RunNotFound, ch_svc.SubmissionNotFound,
+                      ch_svc.AppealNotFound)):
         return HTTPException(404, str(e))
+    if isinstance(e, ch_svc.UnauthorizedReviewer):
+        return HTTPException(401, str(e))
+    if isinstance(e, ch_svc.ForbiddenReviewer):
+        return HTTPException(403, str(e))
     if isinstance(e, ch_svc.ChallengeLocked):
         return HTTPException(403, str(e))
-    if isinstance(e, ch_svc.ReviewConflict):
+    if isinstance(e, (ch_svc.ReviewConflict, ch_svc.AppealConflict)):
+        return HTTPException(409, str(e))
+    if isinstance(e, ch_svc.ReviewerConflict):
         return HTTPException(409, str(e))
     return HTTPException(400, str(e))
 
@@ -134,7 +171,7 @@ def review_queue(status: str = "pending", limit: int = 100):
 
 @router.get("/submissions/{record_id}")
 def get_submission(record_id: int):
-    """成绩详情：审核通过后附带动作方案与轨迹（供回放）。"""
+    """成绩详情：审核通过后附带动作方案与轨迹（供回放），并附申诉状态。"""
     with SessionLocal() as db:
         detail = ch_svc.submission_detail(db, record_id)
     if detail is None:
@@ -142,15 +179,125 @@ def get_submission(record_id: int):
     return detail
 
 
+@router.get("/submissions/{record_id}/timeline")
+def get_timeline(record_id: int):
+    """成绩全链路时间线：提交→初审→申诉→复核→撤销/恢复（可追溯事件档案）。"""
+    with SessionLocal() as db:
+        tl = ch_svc.submission_timeline(db, record_id)
+    if tl is None:
+        raise HTTPException(404, "成绩记录不存在")
+    return tl
+
+
+@router.post("/submissions/{record_id}/appeal", status_code=201)
+def appeal_submission(record_id: int, req: AppealIn):
+    """玩家对驳回/撤销的成绩发起申诉（appeal_id 幂等），成绩进入复核队列。"""
+    try:
+        with SessionLocal() as db:
+            return ch_svc.create_appeal(
+                db, record_id=record_id, player=req.player,
+                reason=req.reason, appeal_id=req.appeal_id)
+    except (ch_svc.SubmissionNotFound, ch_svc.ValidationError,
+            ch_svc.ForbiddenReviewer, ch_svc.AppealConflict) as e:
+        raise _error(e)
+
+
+@router.get("/appeals")
+def appeals(status: str = "pending", limit: int = 50):
+    """申诉队列（默认待复核），供复核员工作流使用。"""
+    with SessionLocal() as db:
+        return {"appeals": ch_svc.list_appeals(db, status=status, limit=limit)}
+
+
+@router.get("/mine/submissions")
+def my_submissions(player: str, challenge_id: Optional[int] = None,
+                   limit: int = 50):
+    """玩家按署名查询本人提交：审核状态/申诉入口/被撤销与回滚情况。"""
+    with SessionLocal() as db:
+        return {"submissions": ch_svc.player_submissions(
+            db, player, challenge_id=challenge_id, limit=limit)}
+
+
+@router.post("/appeals/{appeal_id}/decision")
+def decide_appeal(appeal_id: int, req: AppealDecisionIn,
+                  x_reviewer_token: Optional[str] = Header(default=None)):
+    """复核员裁决申诉：uphold 维持 / overturn 推翻改判通过（含回滚联动效果）。"""
+    try:
+        with SessionLocal() as db:
+            return ch_svc.decide_appeal(
+                db, appeal_id_key=appeal_id, decision=req.decision,
+                note=req.note or "", moderator_token=_token(x_reviewer_token))
+    except (ch_svc.AppealNotFound, ch_svc.ValidationError,
+            ch_svc.UnauthorizedReviewer, ch_svc.ForbiddenReviewer,
+            ch_svc.SubmissionNotFound, ch_svc.ReviewConflict) as e:
+        raise _error(e)
+
+
+@router.post("/submissions/{record_id}/revoke")
+def revoke_submission(record_id: int, req: ModerationIn,
+                      x_reviewer_token: Optional[str] = Header(default=None)):
+    """复核员撤销上榜成绩：出榜 + 关闭回放 + 级联回收解锁（幂等）。"""
+    try:
+        with SessionLocal() as db:
+            return ch_svc.revoke(db, record_id=record_id, note=req.note or "",
+                                 moderator_token=_token(x_reviewer_token))
+    except (ch_svc.SubmissionNotFound, ch_svc.UnauthorizedReviewer,
+            ch_svc.ForbiddenReviewer, ch_svc.ReviewConflict) as e:
+        raise _error(e)
+
+
+@router.post("/submissions/{record_id}/restore")
+def restore_submission(record_id: int, req: ModerationIn,
+                       x_reviewer_token: Optional[str] = Header(default=None)):
+    """复核员恢复被撤销的成绩：重新上榜/回放/解锁（幂等）。"""
+    try:
+        with SessionLocal() as db:
+            return ch_svc.restore(db, record_id=record_id, note=req.note or "",
+                                  moderator_token=_token(x_reviewer_token))
+    except (ch_svc.SubmissionNotFound, ch_svc.UnauthorizedReviewer,
+            ch_svc.ForbiddenReviewer, ch_svc.ReviewConflict) as e:
+        raise _error(e)
+
+
+@router.get("/reviewers/me")
+def reviewer_me(x_reviewer_token: Optional[str] = Header(default=None)):
+    """查询当前审核身份：无 token 时返回内置初审员（本地单机开放入口）。"""
+    try:
+        with SessionLocal() as db:
+            rv = ch_svc.authenticate(db, _token(x_reviewer_token),
+                                     required_role=ch_svc.ROLE_REVIEWER)
+        return {"name": rv.name, "role": rv.role}
+    except (ch_svc.UnauthorizedReviewer, ch_svc.ForbiddenReviewer) as e:
+        raise _error(e)
+
+
+@router.post("/reviewers", status_code=201)
+def create_reviewer(req: ReviewerIn,
+                    x_reviewer_token: Optional[str] = Header(default=None)):
+    """复核员注册新的初审员/复核员账号。"""
+    try:
+        with SessionLocal() as db:
+            actor = ch_svc.authenticate(db, _token(x_reviewer_token),
+                                        required_role=ch_svc.ROLE_MODERATOR)
+            return ch_svc.register_reviewer(
+                db, token=req.token, name=req.name, role=req.role, actor=actor)
+    except (ch_svc.UnauthorizedReviewer, ch_svc.ForbiddenReviewer,
+            ch_svc.ValidationError, ch_svc.ReviewerConflict) as e:
+        raise _error(e)
+
+
 @router.post("/submissions/{record_id}/review")
-def review_submission(record_id: int, req: ReviewIn):
-    """审核成绩：通过后进入排行榜、开放回放并联动解锁；驳回则排除。"""
+def review_submission(record_id: int, req: ReviewIn,
+                      x_reviewer_token: Optional[str] = Header(default=None)):
+    """初审成绩：通过后进入排行榜、开放回放并联动解锁；驳回则排除。"""
     try:
         with SessionLocal() as db:
             return ch_svc.review(db, record_id=record_id,
-                                 action=req.action, note=req.note or "")
+                                 action=req.action, note=req.note or "",
+                                 reviewer_token=_token(x_reviewer_token))
     except (ch_svc.ValidationError, ch_svc.SubmissionNotFound,
-            ch_svc.ReviewConflict) as e:
+            ch_svc.ReviewConflict, ch_svc.UnauthorizedReviewer,
+            ch_svc.ForbiddenReviewer) as e:
         raise _error(e)
 
 

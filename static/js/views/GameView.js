@@ -23,6 +23,8 @@ window.GameView = {
       playerName: Store.get("pilot") || "",
       board: null,
       boardLoading: false,
+      mySubs: [],
+      timeline: null,
       anim: { playing: false, time: 0, speed: 30 },
       view: { scale: 90, cx: 0, cy: 0 },
       dragging: false,
@@ -225,11 +227,67 @@ window.GameView = {
       this.boardLoading = true;
       try {
         this.board = await API.challengeLeaderboard(this.challenge.id);
+        if (this.playerName) {
+          this.mySubs = (await API.mySubmissions(this.playerName, this.challenge.id)).submissions || [];
+        }
       } catch (e) {
         alert("加载排行榜失败：" + e.message);
       } finally {
         this.boardLoading = false;
       }
+    },
+    // ---- 申诉与审核链路 ----
+    async appealRecord(rec) {
+      const reason = window.prompt(
+        `对成绩 #${rec.record_id} 的${
+          rec.review_status === "revoked" ? "撤销" : "驳回"}发起申诉（第 ${rec.appeal_rounds + 1} 轮，最多 2 轮）：\n复核员会重新核查本次飞行的服务端结算档案。`,
+        "");
+      if (reason === null) return;
+      if (!reason.trim()) { alert("申诉理由不能为空"); return; }
+      const appealId = (window.crypto && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : `ap-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      try {
+        await API.appealSubmission(rec.record_id, this.playerName,
+                                   reason.trim(), appealId);
+        await this.openBoard();
+        this.$emit("challenge-change");
+        alert("申诉已受理，成绩进入复核队列，请等待复核员裁决。");
+      } catch (e) {
+        alert("申诉失败：" + e.message);
+      }
+    },
+    async showTimeline(recordId) {
+      try {
+        this.timeline = await API.submissionTimeline(recordId);
+      } catch (e) {
+        alert("加载审核链路失败：" + e.message);
+      }
+    },
+    statusLabel(s) {
+      return { pending: "待审核", approved: "已上榜", rejected: "已驳回",
+               revoked: "已撤销" }[s] || s;
+    },
+    fmtDateTime(ts) {
+      if (!ts) return "";
+      const d = new Date(ts * 1000);
+      const p = n => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+    },
+    tlEventLabel(k) {
+      return {
+        submit: "玩家提交", review_approve: "初审通过", review_reject: "初审驳回",
+        appeal: "玩家申诉", appeal_uphold: "复核维持原判",
+        appeal_overturn: "复核推翻·改判通过", revoke: "复核撤销上榜",
+        restore: "复核恢复上榜", legacy: "历史已审核（补登）",
+      }[k] || k;
+    },
+    tlDetail(e) {
+      const d = e.detail || {};
+      if (e.kind === "appeal") return `第 ${d.round} 轮：${d.reason || ""}`;
+      if (e.kind === "appeal_uphold" || e.kind === "appeal_overturn")
+        return `第 ${d.round} 轮${d.note ? "：" + d.note : ""}`;
+      return d.note || "";
     },
     async playEntry(e) {
       try {
@@ -524,8 +582,68 @@ window.GameView = {
         <p v-else class="plan-empty board-empty">
           还没有审核通过的成绩，来当第一个上榜的飞行员！
         </p>
+
+        <!-- 我在本挑战的成绩：驳回/撤销可申诉，全链路可查 -->
+        <div v-if="mySubs.length" class="board-mine">
+          <h4>🧑‍✈️ 我的提交（{{ mySubs.length }}）</h4>
+          <div v-for="m in mySubs" :key="m.record_id" class="mine-row">
+            <span class="mine-meta">
+              #{{ m.record_id }} · ★{{ m.stars }} · {{ (m.fuel_used * 1731.5).toFixed(1) }} km/s
+              · {{ Math.round(m.elapsed_days) }} 天
+            </span>
+            <span class="mine-status" :class="'s-' + m.review_status">
+              {{ statusLabel(m.review_status) }}
+              <template v-if="m.appeal_open"> · 第 {{ m.appeal_rounds }} 轮申诉复核中</template>
+            </span>
+            <span v-if="m.review_note" class="mine-note">备注：{{ m.review_note }}</span>
+            <button class="btn mini" :disabled="!m.appeal_available"
+                    @click="appealRecord(m)">
+              {{ m.appeal_rounds >= 2 ? '申诉次数已用尽'
+                 : (m.appeal_open ? '申诉复核中' : '⚖ 申诉（剩 ' + (2 - m.appeal_rounds) + ' 轮）') }}
+            </button>
+            <button class="btn mini ghost" @click="showTimeline(m.record_id)">链路</button>
+          </div>
+        </div>
         <div class="modal-btns">
           <button class="btn ghost" @click="board = null">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 审核链路时间线 -->
+    <div v-if="timeline" class="modal-mask" @click.self="timeline = null">
+      <div class="modal timeline-modal">
+        <h2>🔗 审核链路 · 成绩 #{{ timeline.record_id }}</h2>
+        <p class="modal-reason">
+          #{{ timeline.challenge_id }} {{ timeline.challenge_title }} · v{{ timeline.version }}
+          · {{ timeline.player }} · ★{{ timeline.stars }}
+          · <span :class="'s-' + timeline.review_status">{{ statusLabel(timeline.review_status) }}</span>
+        </p>
+        <ul class="timeline-list">
+          <li v-for="e in timeline.events" :key="e.seq" class="tl-item">
+            <div class="tl-dot" :class="'dot-' + e.actor_role"></div>
+            <div class="tl-body">
+              <div class="tl-head">
+                <b>{{ tlEventLabel(e.kind) }}</b>
+                <span class="tl-actor">{{ e.actor || '—' }}（{{
+                  { player: '玩家', reviewer: '初审员', moderator: '复核员',
+                    system: '系统' }[e.actor_role] || e.actor_role }}）</span>
+                <span class="tl-time">{{ fmtDateTime(e.created_at) }}</span>
+              </div>
+              <div v-if="tlDetail(e)" class="tl-detail">{{ tlDetail(e) }}</div>
+            </div>
+          </li>
+        </ul>
+        <div v-if="timeline.appeals && timeline.appeals.length" class="tl-appeals">
+          <div v-for="a in timeline.appeals" :key="a.appeal_id" class="tl-appeal">
+            第 {{ a.round }} 轮：{{ a.reason }}
+            → <b :class="a.status === 'overturn' ? 'ok-text' : 'bad-text'">
+              {{ a.status === 'overturn' ? '推翻原判' : '维持原判' }}</b>
+            <span v-if="a.decided_by">（{{ a.decided_by }}：{{ a.decision_note }}）</span>
+          </div>
+        </div>
+        <div class="modal-btns">
+          <button class="btn ghost" @click="timeline = null">关闭</button>
         </div>
       </div>
     </div>

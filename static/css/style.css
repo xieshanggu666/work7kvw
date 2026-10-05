@@ -309,3 +309,71 @@ body {
 .board-stars .dim { color: rgba(255, 209, 102, 0.22); }
 .board-meta { color: var(--muted); font-size: 12px; white-space: nowrap; }
 .board-empty { text-align: center; padding: 24px 0; }
+
+/* ---------- 申诉与复核链路 ---------- */
+.review-tabs { display: flex; gap: 8px; margin: 14px 0; flex-wrap: wrap; }
+.review-tabs button {
+  background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.15);
+  color: var(--muted); border-radius: 18px; padding: 7px 14px; font-size: 13px;
+  cursor: pointer; position: relative;
+}
+.review-tabs button.active { color: var(--cyan); border-color: var(--cyan); background: rgba(90,220,255,0.1); }
+.mod-token { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+.mod-token input {
+  width: 240px; background: rgba(0,0,0,0.25); border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 6px; color: #e8f0ff; padding: 6px 10px; font-size: 12px;
+}
+.archive-bar { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.status-switch { display: flex; gap: 6px; }
+.status-switch button {
+  background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.15);
+  color: var(--muted); border-radius: 14px; padding: 5px 12px; font-size: 12px; cursor: pointer;
+}
+.status-switch button.active { color: #fff; border-color: var(--cyan); }
+
+.status-tag {
+  display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 10px;
+  margin-left: 6px; border: 1px solid currentColor;
+}
+.tag-pending, .s-pending { color: #ffd479; }
+.tag-ok, .s-approved { color: var(--green); }
+.tag-bad, .s-rejected { color: var(--red); }
+.tag-warn, .s-revoked { color: #c9a0ff; }
+.appeal-tag {
+  font-size: 11px; color: #ffd479; border: 1px solid rgba(255,212,121,0.5);
+  border-radius: 10px; padding: 1px 8px; margin-left: 6px;
+}
+.queue-row.appeal-row { border-color: rgba(255,212,121,0.4); background: rgba(255,212,121,0.05); }
+.appeal-reason { color: #ffd479 !important; }
+.btn.mini.ghost { border-color: rgba(255,255,255,0.25); color: var(--muted); }
+.btn.mini:disabled { opacity: 0.35; cursor: default; }
+
+/* 排行榜内"我的提交" */
+.board-mine { margin-top: 14px; border-top: 1px solid rgba(255,255,255,0.12); padding-top: 10px; }
+.board-mine h4 { font-size: 13px; color: var(--muted); margin-bottom: 8px; font-weight: normal; }
+.mine-row { display: flex; align-items: center; gap: 10px; font-size: 12px; padding: 6px 0; flex-wrap: wrap; }
+.mine-meta { color: #cdd8f0; }
+.mine-status { font-size: 11px; }
+.mine-note { color: var(--muted); font-size: 11px; flex-basis: 100%; }
+
+/* 时间线弹窗 */
+.timeline-modal { max-width: 620px; }
+.timeline-list { list-style: none; margin: 12px 0; padding: 0; max-height: 46vh; overflow-y: auto; }
+.tl-item { display: flex; gap: 12px; padding: 4px 0; }
+.tl-dot {
+  width: 10px; height: 10px; border-radius: 50%; margin-top: 6px; flex: none;
+  background: var(--muted); box-shadow: 0 0 0 3px rgba(255,255,255,0.08);
+}
+.dot-player { background: var(--cyan); }
+.dot-reviewer { background: var(--green); }
+.dot-moderator { background: #c9a0ff; }
+.dot-system { background: var(--muted); }
+.tl-body { flex: 1; min-width: 0; }
+.tl-head { display: flex; gap: 10px; align-items: baseline; font-size: 13px; flex-wrap: wrap; }
+.tl-actor { color: var(--muted); font-size: 12px; }
+.tl-time { color: var(--muted); font-size: 11px; margin-left: auto; }
+.tl-detail { color: #c2cee8; font-size: 12px; margin-top: 2px; line-height: 1.6; }
+.tl-appeals { margin-top: 8px; font-size: 12px; color: var(--muted); }
+.tl-appeal { padding: 4px 0; line-height: 1.6; }
+.ok-text { color: var(--green); }
+.bad-text { color: var(--red); }
