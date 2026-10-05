@@ -13,6 +13,7 @@
 - **评分**：三星 ≤ 55% 燃料预算、二星 ≤ 80%、通关得星；最佳成绩存档（SQLite）
 - **成绩记录**：每次发射落库为可追溯的执行档案（动作方案 + 轨迹 + 结算），成绩关联档案可回放、可载入方案继续调优；提交带幂等键，双击/重试/多标签页不会重复记分；兼容旧版存档
 - **社区航线挑战**：设计者发布带燃料预算与里程碑的**版本化关卡**（每次发布生成不可变版本，旧版本仍可回放）；玩家提交**幂等结算**的飞行记录（服务端评分 + 幂等键去重）；成绩经**审核**后联动排行榜（按版本结算、每人取最佳）、轨迹回放与关卡解锁（内置关卡/前置挑战/累计星数三种解锁条件）
+- **申诉与复核链路**：对初审结论有异议时可发起**幂等申诉**（玩家仅限本人被驳回成绩，审核席可对上榜成绩提请撤榜）；管理员（与原审审核员同人回避）复核后可**翻案**——驳回恢复上榜/解锁，通过则撤榜并回滚排行榜与解锁，或维持原判。提交→初审→申诉→复核全程写入只追加的事件流，可按成绩追溯；重复提交/重复审核/重复复核均幂等，兼容无审核员信息的历史成绩
 - **交互**：实时轨迹预览、滚轮缩放/拖动平移、回放动画、策略提示
 
 ## 技术栈
@@ -21,7 +22,7 @@
 | --- | --- |
 | 后端 | Python 3.10 + FastAPI + SQLAlchemy(SQLite) |
 | 前端 | Vue 3（静态引入）+ Canvas 2D 手绘渲染 |
-| 测试 | pytest（物理守恒/关卡可解性/评分规则/成绩记录与并发幂等/挑战发布与审核联动，42 项） |
+| 测试 | pytest（物理守恒/关卡可解性/评分规则/成绩记录与并发幂等/挑战发布、审核、申诉复核与解锁联动，57 项） |
 
 ## 快速开始
 
@@ -52,7 +53,9 @@ npm run dev
 
 - **设计者**：「发布挑战」填写预算、时限、里程碑（近距飞掠/半径/捕获/弹弓后半径/逃逸）与解锁条件；每次修改通过「＋ 发布新版本」生成不可变版本，成绩按版本结算排行榜
 - **玩家**：进入挑战编排动作并发射，飞行记录由服务端结算后幂等提交（双击/重试不重复），进入审核队列
-- **审核**：「🗂 审核队列」通过或驳回（本地单机，审核入口开放）；通过后成绩进入排行榜、开放轨迹回放，并按解锁条件联动开放后续挑战
+- **审核**：「🗂 审核与申诉复核」初审队列通过或驳回（审核席署名，自审回避；本地单机入口开放）；通过后成绩进入排行榜、开放轨迹回放，并按解锁条件联动开放后续挑战
+- **申诉**：玩家可在结算弹窗对本人被驳回的成绩发起申诉（填写理由，申诉单幂等）；审核席可在「⛔ 上榜异议」对已上榜成绩提请撤榜复核
+- **复核**：管理员（admin 角色，且不得与原审审核员同人）在「⚖ 申诉复核」中裁决——翻案恢复（驳回→通过）或翻案撤榜（通过→revoked，排行榜/解锁自动回滚），或维持原判；「📜 已复核」与每条成绩的「链路」按钮可查看完整事件流
 
 ## 关卡目标
 
@@ -81,11 +84,15 @@ npm run dev
 | GET | `/api/challenges/{cid}/versions/{v}` | 指定版本完整定义 |
 | POST | `/api/challenges/{cid}/preview` | 挑战轨迹预览（不评分、不落库） |
 | POST | `/api/challenges/{cid}/run` | 挑战飞行结算：执行档案落库返回 `run_id`（未解锁 403） |
-| POST | `/api/challenges/{cid}/submit` | 提交飞行记录：`run_id` + `submission_id` 幂等键 → 待审核 |
-| GET | `/api/challenges/{cid}/leaderboard` | 排行榜：仅审核通过，按版本结算，每人取最佳（`?version=` 可查旧版） |
-| GET | `/api/challenges/review_queue` | 全站待审核成绩队列 |
-| POST | `/api/challenges/submissions/{id}/review` | 审核成绩（approve/reject）：通过后上榜、开放回放并联动解锁 |
-| GET | `/api/challenges/submissions/{id}` | 成绩详情：审核通过后附带动作方案与轨迹（供回放） |
+| POST | `/api/challenges/{cid}/submit` | 提交飞行记录：`run_id` + `submission_id` 幂等键 + 稳定 `player_id` → 待审核 |
+| GET | `/api/challenges/{cid}/leaderboard` | 排行榜：仅审核通过，按版本结算，每人取最佳（`?version=` 可查旧版；翻案恢复条目标 `restored`） |
+| GET | `/api/challenges/review_queue` | 初审队列（`?status=` pending/approved/rejected/revoked/all） |
+| POST | `/api/challenges/submissions/{id}/review` | 初审（approve/reject，需 reviewer/admin 身份，自审回避；重复同动作幂等） |
+| POST | `/api/challenges/submissions/{id}/appeal` | 发起申诉：`reason` + `appeal_id` 幂等键；player 仅限本人驳回成绩，reviewer/admin 可对任意终审成绩提撤榜 |
+| GET | `/api/challenges/appeal_queue` | 申诉复核队列（`?status=` pending/upheld/denied） |
+| POST | `/api/challenges/submissions/{id}/appeal/rule` | 管理员复核（upheld 翻案/denied 维持）：仅 admin 且与原审同人回避；重复裁决幂等 |
+| GET | `/api/challenges/submissions/{id}/timeline` | 追溯链路：提交→初审→申诉→复核的只追加事件流 |
+| GET | `/api/challenges/submissions/{id}` | 成绩详情：审核通过后附带动作方案与轨迹（供回放），含申诉信息块 |
 
 ## 目录结构
 
@@ -94,20 +101,31 @@ slingshot_game/
 ├── app/
 │   ├── api/router.py         # 游戏 API
 │   ├── api/challenges.py     # 社区挑战 API（发布/提交/审核/排行榜）
-│   ├── core/                 # 配置 + 数据库
-│   ├── models/               # 最佳成绩汇总 / 执行档案 / 成绩记录 / 挑战与版本 / 挑战成绩
+│   ├── core/                 # 配置 + 数据库（含旧存档轻量迁移）
+│   ├── models/               # 最佳成绩汇总 / 执行档案 / 成绩记录 / 挑战与版本 / 挑战成绩 / 审核申诉事件流
 │   ├── schemas/              # 共享动作模型与校验
 │   └── services/
 │       ├── physics.py        # 轨道力学引擎（弹弓/积分/里程碑）
 │       ├── levels.py         # 关卡定义 + 参考解法
 │       ├── scores.py         # 成绩存档（幂等提交/最佳汇总/回放数据）
-│       └── challenges.py     # 社区挑战（版本化发布/幂等提交/审核/解锁联动）
+│       └── challenges.py     # 社区挑战（版本化发布/幂等提交/审核/申诉复核/解锁联动）
 ├── static/                   # Vue3 + Canvas 前端
 ├── scripts/calibrate.py      # 关卡可解性校准工具（开发用）
-├── tests/                    # pytest（42 项）
+├── tests/                    # pytest（57 项）
 ├── package.json              # npm run dev 一键启动
 └── requirements.txt
 ```
+
+## 审核 / 申诉复核状态机
+
+| 阶段 | 状态迁移 | 权限 | 幂等与冲突 |
+| --- | --- | --- | --- |
+| 提交 | `pending`（默认待初审） | 玩家（带稳定 `player_id`） | `submission_id` 去重 |
+| 初审 | `pending → approved / rejected` | reviewer/admin，**禁止审核本人成绩** | 同动作重复返回当前态；相反动作 409 |
+| 申诉 | `approved/rejected → 申诉待复核` | 玩家仅本人 `rejected/revoked`；reviewer/admin 可代提任意终审成绩 | `appeal_id` 去重；待审中/已决重复申诉 409 |
+| 复核 | `upheld`：`rejected→approved`（恢复）或 `approved→revoked`（撤榜回滚）；`denied`：维持 | **仅 admin，且与原审审核员同人回避** | 同结论重复返回当前态；无待决申诉时裁决 409 |
+
+排行榜、轨迹回放、解锁条件全部派生自 `review_status`：翻案无需级联修补，翻为 `approved` 即恢复上榜/回放/解锁，翻为 `revoked` 即自动撤榜并回滚（后续挑战重新锁定、名次自动顺延）。每个动作写入只追加的 `challenge_review_event`，可通过 timeline 接口与前端「链路」完整追溯；历史成绩（无审核员/申诉字段）经启动时轻量迁移后维持终审状态，同人回避对无原审身份的行自动豁免。
 
 ## 物理模型说明
 

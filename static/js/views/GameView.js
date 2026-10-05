@@ -21,8 +21,13 @@ window.GameView = {
       replayRecord: null,
       replayLoading: false,
       playerName: Store.get("pilot") || "",
+      pilotId: Store.get("pilot_id") || "",
       board: null,
       boardLoading: false,
+      // 申诉表单（仅在本人被驳回成绩的结果区出现）
+      appealing: false,
+      appealReason: "",
+      appealBusy: false,
       anim: { playing: false, time: 0, speed: 30 },
       view: { scale: 90, cx: 0, cy: 0 },
       dragging: false,
@@ -190,9 +195,19 @@ window.GameView = {
           this.replayRecord = null;
           if (r.ok) {
             Store.set("pilot", this.playerName);
+            // 稳定玩家身份（申诉归属/自审回避）：本地生成一次后长期复用
+            if (!this.pilotId) {
+              this.pilotId = (window.crypto && crypto.randomUUID)
+                ? crypto.randomUUID()
+                : `p-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+              Store.set("pilot_id", this.pilotId);
+            }
             const sub = await API.challengeSubmit(
-              this.challenge.id, r.run_id, submissionId, this.playerName);
-            this.result = { ...r, review_status: sub.review_status, record_id: sub.record_id };
+              this.challenge.id, r.run_id, submissionId, this.playerName,
+              this.pilotId);
+            this.result = { ...r, review_status: sub.review_status,
+                            appeal_status: sub.appeal_status,
+                            record_id: sub.record_id };
             this.$emit("challenge-change");
           }
           this.anim.time = 0;
@@ -245,6 +260,31 @@ window.GameView = {
         this.anim.playing = true;
       } catch (err) {
         alert("加载回放失败：" + err.message);
+      }
+    },
+    // ---- 申诉（玩家就本人被驳回成绩提请复核） ----
+    async submitAppeal() {
+      const reason = (this.appealReason || "").trim();
+      if (!reason || this.appealBusy) return;
+      this.appealBusy = true;
+      try {
+        const appealId = (window.crypto && crypto.randomUUID)
+          ? crypto.randomUUID()
+          : `ap-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        const ap = await API.appealSubmission(this.result.record_id, {
+          reason, appeal_id: appealId,
+          player_id: this.pilotId || null,
+          player_name: this.playerName, role: "player",
+        });
+        this.result = { ...this.result,
+                        review_status: ap.review_status,
+                        appeal_status: ap.appeal_status };
+        this.appealing = false;
+        this.appealReason = "";
+      } catch (e) {
+        alert("发起申诉失败：" + e.message);
+      } finally {
+        this.appealBusy = false;
       }
     },
     nextLevel() {
@@ -488,9 +528,37 @@ window.GameView = {
         </div>
         <div class="modal-ms">{{ msText }}</div>
         <p v-if="challenge && result.ok && result.review_status" class="review-note">
-          📋 飞行记录已提交审核（{{ result.review_status === 'pending' ? '待审核' : result.review_status }}），
-          通过后进入排行榜、开放回放并联动关卡解锁。
+          <template v-if="result.review_status === 'pending'">
+            📋 飞行记录已提交，等待审核；通过后进入排行榜、开放回放并联动解锁。
+          </template>
+          <template v-else-if="result.review_status === 'approved'">
+            ✅ 成绩已审核通过，已进入排行榜并开放回放。
+          </template>
+          <template v-else-if="result.review_status === 'rejected' && !result.appeal_status">
+            ❌ 成绩未通过审核。如对结论有异议，可发起申诉，由管理员（与原审不同人）复核。
+          </template>
+          <template v-else-if="result.appeal_status === 'pending'">
+            ⚖ 申诉已提交，等待管理员复核；复核翻案将自动恢复上榜/解锁或撤榜回滚。
+          </template>
+          <template v-else-if="result.appeal_status === 'upheld' && result.review_status === 'approved'">
+            🔁 申诉成立，成绩已恢复上榜与回放。
+          </template>
+          <template v-else>⚖ 申诉已维持原结论（{{ result.review_status }}）。</template>
         </p>
+        <!-- 玩家申诉表单：本人成绩被驳回且尚未申诉 -->
+        <div v-if="challenge && result.ok && result.review_status === 'rejected'
+                    && !appealing && !result.appeal_status" class="appeal-entry">
+          <button class="btn mini" @click="appealing = true">⚖ 发起申诉</button>
+        </div>
+        <div v-if="challenge && appealing" class="appeal-form">
+          <textarea v-model.trim="appealReason" rows="3" maxlength="500"
+                    placeholder="说明申诉理由：例如哪个里程碑实际达成、轨迹数据如何佐证…"></textarea>
+          <div class="appeal-btns">
+            <button class="btn ghost mini" @click="appealing = false">取消</button>
+            <button class="btn primary mini" :disabled="appealBusy || !appealReason.trim()"
+                    @click="submitAppeal">{{ appealBusy ? '提交中…' : '提交申诉' }}</button>
+          </div>
+        </div>
         <div class="modal-btns">
           <button class="btn ghost" @click="result = null; anim.playing = true">▶ 回放</button>
           <button class="btn ghost" @click="result = null; reset()">重玩</button>
@@ -517,6 +585,7 @@ window.GameView = {
             </span>
             <span class="board-meta">
               {{ (e.fuel_used * 1731.5).toFixed(1) }} km/s · {{ Math.round(e.elapsed_days) }} 天
+              <span v-if="e.restored" class="restored-tag" title="经申诉复核后恢复">🔁 复核恢复</span>
             </span>
             <button class="btn mini" @click="playEntry(e)">▶ 回放</button>
           </div>

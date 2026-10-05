@@ -118,11 +118,20 @@ class ChallengeRun(Base):
 
 
 class ChallengeSubmission(Base):
-    """挑战成绩提交记录：幂等键去重 + 审核状态机。
+    """挑战成绩提交记录：幂等键去重 + 审核/申诉复核状态机。
 
     submission_id 是客户端生成的幂等键（双击/重试/多标签页只结算一次）。
-    审核状态 pending → approved/rejected；只有 approved 的成绩才进入排行榜、
+    初审状态 pending → approved/rejected；只有 approved 的成绩才进入排行榜、
     开放轨迹回放，并计入关卡解锁条件。
+
+    申诉与复核（可追溯链路）：
+    - 玩家/审核席对终审成绩发起 appeal（appeal_id 为申诉幂等键），
+      appeal_status: ""（未申诉）→ pending → upheld/denied。
+    - 管理员复核（reviewer_role=admin，且不得与原审同人）：
+      uphold 翻案 —— rejected→approved（恢复上榜/回放/解锁），
+      approved→revoked（撤榜并回滚排行榜/解锁）；deny 维持原判。
+    - reviewed_by/appeal_reviewed_by 等身份字段对历史成绩允许为空（旧存档兼容）；
+      完整操作链路记录在 ChallengeReviewEvent（只追加，不可改）。
     """
     __tablename__ = "challenge_submission"
 
@@ -132,10 +141,49 @@ class ChallengeSubmission(Base):
     challenge_id = Column(Integer, nullable=False, index=True)
     version = Column(Integer, nullable=False)
     player = Column(String(24), nullable=False, default="匿名飞行员")
+    player_id = Column(String(64), nullable=True, index=True)  # 稳定身份（申诉归属/自审回避）；历史行可为空
     stars = Column(Integer, nullable=False, default=0)
     fuel_used = Column(Float, nullable=False, default=0.0)
     elapsed_days = Column(Float, nullable=False, default=0.0)
     review_status = Column(String(16), nullable=False, default="pending", index=True)
+    # pending / approved / rejected / revoked（复核翻案撤榜）
     review_note = Column(String(200), nullable=False, default="")
+    reviewed_by = Column(String(64), nullable=True)        # 原审审核员稳定 id
+    reviewed_by_name = Column(String(24), nullable=True)   # 原审审核员署名
     reviewed_at = Column(Float, nullable=True)
+    # ---- 申诉 / 复核 ----
+    appeal_id = Column(String(64), nullable=True, unique=True, index=True)  # 申诉幂等键
+    appeal_status = Column(String(16), nullable=False, default="", index=True)
+    # "" / pending / upheld / denied
+    appeal_reason = Column(Text, nullable=False, default="")
+    appealed_by = Column(String(64), nullable=True)
+    appealed_by_name = Column(String(24), nullable=True)
+    appealed_at = Column(Float, nullable=True)
+    appeal_note = Column(String(200), nullable=False, default="")  # 复核结论备注
+    appeal_reviewed_by = Column(String(64), nullable=True)        # 复核管理员 id
+    appeal_reviewed_by_name = Column(String(24), nullable=True)
+    appeal_reviewed_at = Column(Float, nullable=True)
+    created_at = Column(Float, nullable=False, default=time.time)
+
+
+class ChallengeReviewEvent(Base):
+    """审核/申诉链路事件流（只追加）：提交 → 初审 → 申诉 → 复核，全程可追溯。
+
+    每条成绩的事件按 seq 递增；任何状态迁移都在此留痕，记录操作人身份、
+    角色与动作明细，不随状态翻转而修改或删除。
+    """
+    __tablename__ = "challenge_review_event"
+    __table_args__ = (UniqueConstraint("submission_id", "seq",
+                                       name="uq_review_event_seq"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    submission_id = Column(Integer, ForeignKey("challenge_submission.id"),
+                           nullable=False, index=True)
+    seq = Column(Integer, nullable=False)
+    actor = Column(String(64), nullable=False, default="")        # 操作人稳定 id
+    actor_name = Column(String(24), nullable=False, default="")   # 操作人署名
+    actor_role = Column(String(16), nullable=False, default="")   # player/reviewer/admin
+    # submit / review / appeal / appeal_rule
+    action = Column(String(24), nullable=False)
+    detail_json = Column(Text, nullable=False, default="{}")
     created_at = Column(Float, nullable=False, default=time.time)

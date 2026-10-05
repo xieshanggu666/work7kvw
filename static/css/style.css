@@ -271,6 +271,69 @@ body {
 .btn.approve:hover { background: rgba(124, 232, 184, 0.12); border-color: var(--green); }
 .btn.reject { border-color: rgba(255, 123, 143, 0.5); color: var(--red); }
 .btn.reject:hover { background: rgba(255, 123, 143, 0.12); border-color: var(--red); }
+.btn.ghost.mini { border-color: var(--line); color: var(--muted); }
+
+/* 申诉与复核 */
+.review-tabs { display: flex; gap: 8px; margin: 12px 0; flex-wrap: wrap; }
+.review-tabs button {
+  border: 1px solid var(--line); background: transparent; color: var(--muted);
+  border-radius: 999px; padding: 5px 14px; font-size: 12px; cursor: pointer;
+}
+.review-tabs button.on { border-color: var(--gold); color: var(--gold); background: rgba(255,209,102,0.08); }
+.identity-row {
+  display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap;
+  border: 1px dashed var(--line); border-radius: 10px; padding: 10px 12px;
+  margin-bottom: 12px; font-size: 12px;
+}
+.identity-row label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); }
+.identity-row input, .identity-row select { width: 150px; }
+.identity-hint { color: var(--muted); font-size: 11px; }
+.appeal-row { align-items: flex-start; flex-wrap: wrap; }
+.appeal-row .queue-note { width: 180px; }
+.appeal-reason {
+  margin-top: 6px; font-size: 12px; line-height: 1.6;
+  border-left: 2px solid var(--gold); padding-left: 8px; color: var(--text, #eee);
+}
+.appeal-reason .muted { color: var(--muted); }
+.appeal-badge {
+  font-size: 11px; color: var(--gold); border: 1px solid rgba(255,209,102,0.5);
+  border-radius: 999px; padding: 0 8px; margin-left: 6px;
+}
+.status-tag {
+  font-size: 11px; border-radius: 999px; padding: 0 8px; margin-left: 6px;
+  border: 1px solid var(--line); color: var(--muted);
+}
+.status-tag.approved { color: var(--green); border-color: rgba(124,232,184,0.5); }
+.status-tag.rejected, .status-tag.revoked { color: var(--red); border-color: rgba(255,123,143,0.5); }
+.restored-tag { font-size: 11px; color: var(--green); }
+
+/* 结算弹窗内申诉表单 */
+.appeal-entry { text-align: center; margin-bottom: 10px; }
+.appeal-form {
+  border: 1px solid var(--line); border-radius: 10px; padding: 10px;
+  margin-bottom: 12px; text-align: left;
+}
+.appeal-form textarea {
+  width: 100%; background: rgba(255,255,255,0.05); color: inherit;
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px; resize: vertical;
+}
+.appeal-btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+
+/* 追溯链路时间线 */
+.timeline-panel { margin-top: 8px; }
+.timeline-list { list-style: none; padding: 0; margin: 12px 0; display: flex; flex-direction: column; gap: 8px; }
+.timeline-list li {
+  display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap;
+  border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; font-size: 12px;
+}
+.tl-seq {
+  width: 20px; height: 20px; border-radius: 6px; background: rgba(255,209,102,0.15);
+  color: var(--gold); display: inline-flex; align-items: center; justify-content: center;
+  font-size: 11px; flex-shrink: 0;
+}
+.tl-action { font-weight: 600; min-width: 72px; }
+.tl-actor { color: var(--muted); }
+.tl-detail { color: var(--muted); flex-basis: 100%; padding-left: 30px; line-height: 1.6; }
 
 /* 挑战游玩 */
 .player-row {

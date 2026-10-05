@@ -7,9 +7,10 @@ from fastapi.responses import FileResponse
 from app.api.router import router
 from app.api.challenges import router as challenges_router
 from app.core.config import PORT
-from app.core.database import Base, engine
+from app.core.database import Base, engine, migrate
 
 Base.metadata.create_all(bind=engine)
+migrate(engine)  # 旧存档补齐申诉/复核链路列（幂等）
 
 app = FastAPI(title="引力跳板：星际弹弓轨道规划游戏")
 app.include_router(router)

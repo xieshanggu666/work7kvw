@@ -57,11 +57,35 @@ class SubmitIn(BaseModel):
     run_id: str
     submission_id: Optional[str] = None
     player: Optional[str] = None
+    player_id: Optional[str] = None  # 玩家稳定身份（申诉归属/自审回避），缺省兼容旧客户端
 
 
-class ReviewIn(BaseModel):
+class ReviewerIn(BaseModel):
+    """审核席身份：id 为稳定标识（自审/同人回避依据），role 决定权限。"""
+    reviewer_id: Optional[str] = None
+    reviewer_name: Optional[str] = None
+    reviewer_role: str = "reviewer"  # reviewer / admin（admin 才能复核申诉）
+
+
+class ReviewIn(ReviewerIn):
     action: str                 # approve / reject
     note: Optional[str] = ""
+
+
+class AppealIn(BaseModel):
+    """发起申诉：appeal_id 为申诉幂等键；player 申诉本人驳回，审核席可代提异议。"""
+    reason: str
+    appeal_id: Optional[str] = None
+    player_id: Optional[str] = None
+    player_name: Optional[str] = None
+    role: str = "player"        # player / reviewer / admin
+
+
+class RuleAppealIn(ReviewerIn):
+    """管理员复核申诉：upheld 翻案（上榜↔撤榜）/ denied 维持原判。"""
+    decision: str               # upheld / denied
+    note: Optional[str] = ""
+    reviewer_role: str = "admin"  # 复核仅管理员
 
 
 def _dump(model) -> dict:
@@ -98,7 +122,11 @@ def _error(e: Exception) -> HTTPException:
         return HTTPException(404, str(e))
     if isinstance(e, ch_svc.ChallengeLocked):
         return HTTPException(403, str(e))
-    if isinstance(e, ch_svc.ReviewConflict):
+    if isinstance(e, ch_svc.ReviewerPermission):
+        return HTTPException(403, str(e))
+    if isinstance(e, (ch_svc.ReviewConflict, ch_svc.AppealConflict)):
+        return HTTPException(409, str(e))
+    if isinstance(e, ch_svc.AppealNotAllowed):
         return HTTPException(409, str(e))
     return HTTPException(400, str(e))
 
@@ -127,14 +155,21 @@ def create_challenge(req: CreateChallengeIn):
 
 @router.get("/review_queue")
 def review_queue(status: str = "pending", limit: int = 100):
-    """全站成绩提交队列（默认待审核），供审核工作流使用。"""
+    """全站成绩提交队列（默认待初审），供审核工作流使用。"""
     with SessionLocal() as db:
         return {"submissions": ch_svc.list_submissions(db, status=status, limit=limit)}
 
 
+@router.get("/appeal_queue")
+def appeal_queue(status: str = "pending", limit: int = 100):
+    """申诉复核队列（默认待管理员复核），含每条成绩的申诉信息。"""
+    with SessionLocal() as db:
+        return {"submissions": ch_svc.list_appeal_queue(db, status=status, limit=limit)}
+
+
 @router.get("/submissions/{record_id}")
 def get_submission(record_id: int):
-    """成绩详情：审核通过后附带动作方案与轨迹（供回放）。"""
+    """成绩详情：审核通过后附带动作方案与轨迹（供回放）；含申诉/复核信息。"""
     with SessionLocal() as db:
         detail = ch_svc.submission_detail(db, record_id)
     if detail is None:
@@ -142,15 +177,69 @@ def get_submission(record_id: int):
     return detail
 
 
+@router.get("/submissions/{record_id}/timeline")
+def submission_timeline(record_id: int):
+    """追溯链路：提交 → 初审 → 申诉 → 复核的完整事件流。"""
+    with SessionLocal() as db:
+        events = ch_svc.appeal_timeline(db, record_id)
+    if events is None:
+        raise HTTPException(404, "成绩记录不存在")
+    return {"record_id": record_id, "events": events}
+
+
 @router.post("/submissions/{record_id}/review")
 def review_submission(record_id: int, req: ReviewIn):
-    """审核成绩：通过后进入排行榜、开放回放并联动解锁；驳回则排除。"""
+    """初审成绩：通过后进入排行榜、开放回放并联动解锁；驳回则排除。
+
+    需审核席身份（reviewer/admin），不能审核本人提交的成绩（自审回避）。
+    """
     try:
         with SessionLocal() as db:
             return ch_svc.review(db, record_id=record_id,
-                                 action=req.action, note=req.note or "")
+                                 action=req.action, note=req.note or "",
+                                 reviewer_id=req.reviewer_id,
+                                 reviewer_name=req.reviewer_name,
+                                 reviewer_role=req.reviewer_role)
     except (ch_svc.ValidationError, ch_svc.SubmissionNotFound,
-            ch_svc.ReviewConflict) as e:
+            ch_svc.ReviewConflict, ch_svc.ReviewerPermission) as e:
+        raise _error(e)
+
+
+@router.post("/submissions/{record_id}/appeal")
+def appeal_submission(record_id: int, req: AppealIn):
+    """对终审成绩发起申诉（appeal_id 幂等）：进入管理员复核队列。
+
+    player 仅可申诉本人被驳回成绩；reviewer/admin 可代为申诉任意终审成绩
+    （含对已上榜成绩提撤榜复核）。
+    """
+    try:
+        with SessionLocal() as db:
+            return ch_svc.appeal(db, record_id=record_id, reason=req.reason,
+                                 appeal_id=req.appeal_id,
+                                 player_id=req.player_id,
+                                 player_name=req.player_name,
+                                 role=req.role)
+    except (ch_svc.ValidationError, ch_svc.SubmissionNotFound,
+            ch_svc.AppealNotAllowed, ch_svc.AppealConflict,
+            ch_svc.ReviewerPermission) as e:
+        raise _error(e)
+
+
+@router.post("/submissions/{record_id}/appeal/rule")
+def rule_appeal_submission(record_id: int, req: RuleAppealIn):
+    """管理员复核申诉：upheld 翻案（恢复上榜 / 撤榜并回滚解锁）/ denied 维持。
+
+    仅 reviewer_role=admin，且复核人不得与原审审核员同人（历史成绩豁免）。
+    """
+    try:
+        with SessionLocal() as db:
+            return ch_svc.appeal_rule(
+                db, record_id=record_id, decision=req.decision,
+                note=req.note or "", reviewer_id=req.reviewer_id,
+                reviewer_name=req.reviewer_name,
+                reviewer_role=req.reviewer_role)
+    except (ch_svc.ValidationError, ch_svc.SubmissionNotFound,
+            ch_svc.AppealConflict, ch_svc.ReviewerPermission) as e:
         raise _error(e)
 
 
@@ -236,7 +325,8 @@ def submit(challenge_id: int, req: SubmitIn):
             return ch_svc.submit(db, challenge_id=challenge_id,
                                  run_id=req.run_id,
                                  submission_id=req.submission_id,
-                                 player=req.player)
+                                 player=req.player,
+                                 player_id=req.player_id)
     except (ch_svc.RunNotFound, ch_svc.RunChallengeMismatch) as e:
         raise _error(e)
 

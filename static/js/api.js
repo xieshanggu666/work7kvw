@@ -65,22 +65,59 @@ const API = {
     });
   },
   // 提交飞行记录：run_id 关联服务端执行档案，submission_id 为幂等键
-  challengeSubmit(cid, run_id, submission_id, player) {
+  // player_id 为玩家稳定身份（申诉归属/自审回避），本地生成后持久化
+  challengeSubmit(cid, run_id, submission_id, player, playerId) {
     return this._req(`/api/challenges/${cid}/submit`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ run_id, submission_id, player }),
+      body: JSON.stringify({ run_id, submission_id, player, player_id: playerId || null }),
     });
   },
   challengeLeaderboard(cid, version) {
     const q = version ? `?version=${version}` : "";
     return this._req(`/api/challenges/${cid}/leaderboard${q}`);
   },
-  reviewQueue() { return this._req("/api/challenges/review_queue"); },
-  reviewSubmission(recordId, action, note) {
+  reviewQueue(status) {
+    const q = status ? `?status=${status}` : "";
+    return this._req(`/api/challenges/review_queue${q}`);
+  },
+  // 初审：reviewer/admin 身份，不能审核本人成绩
+  reviewSubmission(recordId, action, note, reviewer) {
     return this._req(`/api/challenges/submissions/${recordId}/review`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action, note: note || "" }),
+      body: JSON.stringify({
+        action, note: note || "",
+        reviewer_id: (reviewer && reviewer.id) || "local-reviewer",
+        reviewer_name: (reviewer && reviewer.name) || "本地审核席",
+        reviewer_role: (reviewer && reviewer.role) || "reviewer",
+      }),
     });
+  },
+  // 申诉队列（管理员复核）
+  appealQueue(status) {
+    const q = status ? `?status=${status}` : "";
+    return this._req(`/api/challenges/appeal_queue${q}`);
+  },
+  // 发起申诉：appeal_id 幂等键
+  appealSubmission(recordId, payload) {
+    return this._req(`/api/challenges/submissions/${recordId}/appeal`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  },
+  // 管理员复核：upheld 翻案（恢复/撤榜）/ denied 维持
+  ruleAppeal(recordId, decision, note, reviewer) {
+    return this._req(`/api/challenges/submissions/${recordId}/appeal/rule`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        decision, note: note || "",
+        reviewer_id: (reviewer && reviewer.id) || "local-admin",
+        reviewer_name: (reviewer && reviewer.name) || "本地管理员",
+        reviewer_role: "admin",
+      }),
+    });
+  },
+  submissionTimeline(recordId) {
+    return this._req(`/api/challenges/submissions/${recordId}/timeline`);
   },
   challengeSubmission(recordId) {
     return this._req(`/api/challenges/submissions/${recordId}`);
